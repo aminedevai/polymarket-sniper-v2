@@ -1,0 +1,56 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+venv/
+ENV/
+env/
+.venv/
+.env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs and databases
+*.log
+logs/
+*.sqlite
+
+# Sensitive files - NEVER COMMIT THESE
+.env
+.env.*
+!.env.template
+*.pem
+*.key
+config.yaml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Playwright
+playwright-browser/
+
+# Project specific
+current_token.json
+trades_*.csv
