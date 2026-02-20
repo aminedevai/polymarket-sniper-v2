@@ -1,11 +1,23 @@
 """
-core/market_finder.py - MANUAL TOKEN OVERRIDE VERSION
+core/market_finder.py
+=====================
+Finds active 5-minute BTC markets using slug pattern:
+  btc-updown-5m-{UNIX_TIMESTAMP}
+
+Market structure (confirmed Feb 2026):
+  - outcomes: ["Up", "Down"]
+  - clobTokenIds: JSON string (not a list) containing array of token IDs
+  - clobTokenIds[0] = UP token (YES equivalent)
+  - clobTokenIds[1] = DOWN token (NO equivalent)
+  - endDate: ISO string e.g. "2026-02-20T08:20:00Z"
+  - conditionId: hex string for CLOB subscription
 """
 
 import asyncio
+import json
 import logging
 import time
-import os
+from datetime import datetime, timezone
 
 import aiohttp
 
@@ -13,148 +25,169 @@ from core.state import SharedState
 
 logger = logging.getLogger(__name__)
 
-GAMMA_URL = "https://gamma-api.polymarket.com/markets"
+GAMMA_EVENTS_URL = "https://gamma-api.polymarket.com/events"
+
+
+def get_5min_boundaries(n: int = 4) -> list[int]:
+    """Returns current + next N-1 five-minute boundary timestamps."""
+    now = int(time.time())
+    current = (now // 300) * 300
+    return [current + (i * 300) for i in range(n)]
+
+
+def parse_clob_token_ids(raw) -> list[str]:
+    """
+    clobTokenIds comes back as a JSON string like:
+    '["443...abc", "221...def"]'
+    Parse it into a proper list.
+    """
+    if isinstance(raw, list):
+        return raw
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                return [str(t) for t in parsed]
+        except Exception:
+            pass
+    return []
+
+
+def parse_end_ts(market: dict) -> int:
+    """Parse endDate ISO string → Unix timestamp."""
+    for field in ("endDate", "endDateIso", "end_date"):
+        val = market.get(field)
+        if val and isinstance(val, str) and "T" in val:
+            try:
+                dt = datetime.fromisoformat(val.replace("Z", "+00:00"))
+                return int(dt.timestamp())
+            except Exception:
+                pass
+        elif isinstance(val, (int, float)) and val > 1_000_000_000:
+            return int(val)
+    return 0
 
 
 class MarketFinder:
-    POLL_INTERVAL_S = 15
+    POLL_INTERVAL_S = 10
 
     def __init__(self, state: SharedState):
         self.state = state
         self.on_rotation = asyncio.Event()
 
-        # Get manual token from environment
-        self.manual_token = os.environ.get("POLY_TOKEN_ID", "")
-        self.manual_condition = os.environ.get("POLY_CONDITION_ID", "")
-        self.manual_question = os.environ.get("POLY_QUESTION", "Manual 5-min BTC")
-
-        # Track rotation timing for 5-min markets
-        self._current_token = ""
-        self._market_start_time = 0
-
-    def _calculate_5min_rotation(self):
-        """
-        Calculate when the next 5-minute rotation should happen.
-        Returns seconds until next rotation.
-        """
-        now = int(time.time())
-        # 5-minute blocks: :00, :05, :10, :15, :20, :25, :30, :35, :40, :45, :50, :55
-        next_rotation = ((now // 300) + 1) * 300
-        seconds_until = next_rotation - now
-        return seconds_until, next_rotation
-
-    async def _fetch_fallback_market(self) -> dict | None:
-        """
-        Fetch any available BTC market as fallback.
-        """
+    async def _fetch_event_by_slug(
+        self, session: aiohttp.ClientSession, slug: str
+    ) -> dict | None:
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                        GAMMA_URL,
-                        params={"active": "true", "closed": "false", "_c": "bitcoin", "limit": 10},
-                        timeout=10
-                ) as resp:
-                    if resp.status == 200:
-                        markets = await resp.json()
-                        for m in markets:
-                            if m.get("active") and not m.get("closed"):
-                                tokens = m.get("clobTokenIds", [])
-                                if tokens:
-                                    return m
+            async with session.get(
+                GAMMA_EVENTS_URL,
+                params={"slug": slug},
+                timeout=aiohttp.ClientTimeout(total=8),
+            ) as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+                if isinstance(data, list) and data:
+                    return data[0]
         except Exception as e:
-            logger.debug(f"Fallback fetch failed: {e}")
+            logger.debug(f"Slug {slug} failed: {e}")
+        return None
+
+    async def _fetch_active_market(self) -> dict | None:
+        boundaries = get_5min_boundaries(n=4)
+        now = int(time.time())
+
+        async with aiohttp.ClientSession() as session:
+            for ts in boundaries:
+                slug = f"btc-updown-5m-{ts}"
+                event = await self._fetch_event_by_slug(session, slug)
+                if not event:
+                    continue
+
+                markets = event.get("markets", [])
+                if not markets:
+                    continue
+
+                # Find active, non-closed market with CLOB enabled
+                active = [
+                    m for m in markets
+                    if m.get("active", False)
+                    and not m.get("closed", False)
+                    and m.get("enableOrderBook", False)
+                ]
+                if not active:
+                    continue
+
+                market = active[0]
+
+                # Parse token IDs from JSON string
+                token_ids = parse_clob_token_ids(market.get("clobTokenIds", []))
+                if len(token_ids) < 2:
+                    logger.warning(
+                        f"Market {slug} has {len(token_ids)} tokens — expected ≥2"
+                    )
+                    continue
+
+                end_ts = parse_end_ts(market)
+                seconds_remaining = max(0, end_ts - now)
+
+                if seconds_remaining < 5:
+                    logger.debug(f"{slug} expires in {seconds_remaining}s — skip")
+                    continue
+
+                # Inject parsed data back onto market dict
+                market["_token_up"] = token_ids[0]    # UP = YES
+                market["_token_down"] = token_ids[1]  # DOWN = NO
+                market["_end_ts"] = end_ts
+                market["_slug"] = slug
+
+                logger.info(
+                    f"Market: {market.get('question','')[:55]} | "
+                    f"ends in {seconds_remaining}s | "
+                    f"Up={token_ids[0][:10]}... "
+                    f"Down={token_ids[1][:10]}..."
+                )
+                return market
+
+        logger.warning(
+            f"No active 5-min BTC market found. "
+            f"Checked: {[f'btc-updown-5m-{ts}' for ts in boundaries]}"
+        )
         return None
 
     async def start(self):
-        """Main loop with manual token support"""
-
-        # If manual token is set, use it exclusively
-        if self.manual_token:
-            logger.info(f"Using MANUAL token: {self.manual_token[:20]}...")
-            self._current_token = self.manual_token
-
-            self.state.active_token_id = self.manual_token
-            self.state.active_condition_id = self.manual_condition or "manual"
-            self.state.seconds_remaining = 300  # 5 minutes default
-            self.state.market_end_ts = int(time.time()) + 300
-
-            # Set open price if available
-            if self.state.rtds_chainlink_price > 0:
-                self.state.candle_open_price = self.state.rtds_chainlink_price
-            elif self.state.btc_price > 0:
-                self.state.candle_open_price = self.state.btc_price
-
-            logger.info(
-                f"MANUAL MARKET SET: {self.manual_question} | "
-                f"Token: {self.manual_token[:16]}... | "
-                f"Open: ${self.state.candle_open_price:.2f}"
-            )
-            self.on_rotation.set()
-            self.on_rotation.clear()
-
-            # Keep alive with countdown
-            while True:
-                now = int(time.time())
-                elapsed = now - self._market_start_time if self._market_start_time > 0 else 0
-                remaining = max(0, 300 - (elapsed % 300))
-                self.state.seconds_remaining = remaining
-
-                # Log countdown every minute
-                if remaining % 60 == 0 and remaining > 0:
-                    logger.info(f"Manual market T-{remaining}s remaining")
-
-                await asyncio.sleep(self.POLL_INTERVAL_S)
-
-            return  # Never reached but for clarity
-
-        # Otherwise try to auto-discover (will likely fail for 5-min markets)
-        logger.warning("No manual token set. Attempting auto-discovery...")
-        logger.warning("5-minute markets are geo-restricted. Set POLY_TOKEN_ID env var.")
-
         while True:
             try:
-                # Try to find any market (fallback to long-term BTC)
-                market = await self._fetch_fallback_market()
-
+                market = await self._fetch_active_market()
                 if market:
-                    token_ids = market.get("clobTokenIds", [])
-                    if token_ids:
-                        token_id = token_ids[0]
+                    token_up   = market["_token_up"]
+                    token_down = market["_token_down"]
+                    condition_id = market.get("conditionId", "")
+                    end_ts = market["_end_ts"]
+                    now_ts = int(time.time())
+                    seconds_remaining = max(0, end_ts - now_ts)
 
-                        if token_id != self._current_token:
-                            self._current_token = token_id
+                    self.state.seconds_remaining = seconds_remaining
 
-                            end_ts = 0
-                            val = market.get("endDateIso") or market.get("endDate")
-                            if val:
-                                try:
-                                    from datetime import datetime
-                                    dt = datetime.fromisoformat(val.replace("Z", "+00:00"))
-                                    end_ts = int(dt.timestamp())
-                                except:
-                                    pass
+                    # Store both tokens so strategy can trade either side
+                    if token_up != self.state.active_token_id:
+                        if self.state.rtds_chainlink_price > 0:
+                            self.state.candle_open_price = self.state.rtds_chainlink_price
+                        elif self.state.btc_price > 0:
+                            self.state.candle_open_price = self.state.btc_price
 
-                            now_ts = int(time.time())
-                            seconds_remaining = max(0, end_ts - now_ts) if end_ts > 0 else 300
+                        self.state.active_token_id   = token_up    # UP token
+                        self.state.active_token_down = token_down  # DOWN token
+                        self.state.active_condition_id = condition_id
+                        self.state.market_end_ts = end_ts
 
-                            self.state.active_token_id = token_id
-                            self.state.active_condition_id = market.get("conditionId", "")
-                            self.state.seconds_remaining = seconds_remaining
-                            self.state.market_end_ts = end_ts
-
-                            if self.state.rtds_chainlink_price > 0:
-                                self.state.candle_open_price = self.state.rtds_chainlink_price
-                            elif self.state.btc_price > 0:
-                                self.state.candle_open_price = self.state.btc_price
-
-                            logger.info(
-                                f"Auto-selected: {market.get('question', '')[:40]}... | "
-                                f"T-{seconds_remaining}s"
-                            )
-                            self.on_rotation.set()
-                            self.on_rotation.clear()
-                else:
-                    logger.warning("No markets found via API")
+                        logger.info(
+                            f"Market rotated → "
+                            f"{market.get('question','')[:55]} | "
+                            f"ends in {seconds_remaining}s | "
+                            f"open={self.state.candle_open_price:.2f}"
+                        )
+                        self.on_rotation.set()
+                        self.on_rotation.clear()
 
             except Exception as e:
                 logger.error(f"MarketFinder error: {e}", exc_info=True)
@@ -162,10 +195,4 @@ class MarketFinder:
             await asyncio.sleep(self.POLL_INTERVAL_S)
 
     async def fetch_once(self) -> dict | None:
-        if self.manual_token:
-            return {
-                "clobTokenIds": [self.manual_token],
-                "conditionId": self.manual_condition or "manual",
-                "question": self.manual_question
-            }
-        return await self._fetch_fallback_market()
+        return await self._fetch_active_market()

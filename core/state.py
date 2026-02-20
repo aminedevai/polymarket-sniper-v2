@@ -47,7 +47,8 @@ class SharedState:
     oracle_stale_ms: float = 0.0        # ms since chainlink last updated
 
     # ── Market metadata (written by MarketFinder) ─────────────────────────
-    active_token_id: str = ""
+    active_token_id: str = ""           # UP token (YES equivalent)
+    active_token_down: str = ""         # DOWN token (NO equivalent)
     active_condition_id: str = ""
     market_end_ts: int = 0
     seconds_remaining: float = 300.0

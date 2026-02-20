@@ -105,11 +105,16 @@ class TakerSniper:
             self.state.open_position_price = signal.target_price
             return {"status": "paper", "side": signal.side, "size": size_usdc}
 
-        # Live execution
+        # Live execution — UP token for YES side, DOWN token for NO side
         try:
-            clob_side = "BUY"  # always buy (YES or NO token)
+            token_id = (
+                self.state.active_token_id
+                if signal.side == "YES"
+                else (self.state.active_token_down or self.state.active_token_id)
+            )
+            clob_side = "BUY"  # always BUY the token (Up or Down)
             resp = self.executor.execute_taker_fok(
-                token_id=self.state.active_token_id,
+                token_id=token_id,
                 amount_usdc=size_usdc,
                 side=clob_side,
             )

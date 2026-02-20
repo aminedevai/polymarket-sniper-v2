@@ -1,68 +1,86 @@
-#!/usr/bin/env python3
 """
-test_5min_discovery.py - Test finding 5-min markets by timestamp
+find_5min_markets.py
+====================
+Run this to find exactly what 5-minute BTC markets exist on Polymarket right now.
+Tries multiple API endpoints and search strategies.
+
+Usage:
+    python find_5min_markets.py
 """
 import asyncio
 import aiohttp
-import time
-import datetime
+import json
+
+GAMMA_URL = "https://gamma-api.polymarket.com/markets"
+GAMMA_EVENTS = "https://gamma-api.polymarket.com/events"
 
 
-async def find_by_timestamp(target_ts: int):
-    """Try to find market for specific timestamp"""
-    slug = f"btc-updown-5m-{target_ts}"
-    print(f"Searching for: {slug}")
-    print(f"Target time: {datetime.datetime.fromtimestamp(target_ts, tz=datetime.timezone.utc)}")
-
-    # Try Gamma API with various search patterns
-    urls = [
-        f"https://gamma-api.polymarket.com/markets?active=true&closed=false&_c={slug}&limit=10",
-        f"https://gamma-api.polymarket.com/markets?active=true&closed=false&_c=btc-updown-5m&limit=20",
-        f"https://gamma-api.polymarket.com/events?active=true&closed=false&_c={slug}&limit=10",
-    ]
-
-    async with aiohttp.ClientSession() as session:
-        for url in urls:
-            print(f"\nTrying: {url[:80]}...")
-            try:
-                async with session.get(url, timeout=10) as resp:
-                    print(f"Status: {resp.status}")
-                    if resp.status == 200:
-                        data = await resp.json()
-                        print(f"Results: {len(data)}")
-
-                        # Print first few items
-                        for item in data[:3]:
-                            if isinstance(item, dict):
-                                print(f"  - {item.get('question', item.get('title', 'N/A'))[:60]}")
-                                print(f"    Slug: {item.get('slug', 'N/A')}")
-                                tokens = item.get("clobTokenIds", [])
-                                if tokens:
-                                    print(f"    Token: {tokens[0][:20]}...")
-            except Exception as e:
-                print(f"Error: {e}")
+async def try_endpoint(session, url, params, label):
+    try:
+        async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as r:
+            data = await r.json()
+            if isinstance(data, list):
+                print(f"\n[{label}] → {len(data)} results")
+                for m in data[:5]:
+                    q = m.get("question", m.get("title", ""))[:100]
+                    active = m.get("active")
+                    closed = m.get("closed")
+                    end = m.get("endDate", "")[:20]
+                    cids = m.get("clobTokenIds", [])
+                    print(f"  active={active} closed={closed} end={end} clobIds={len(cids)} | {q}")
+                if len(data) > 5:
+                    print(f"  ... and {len(data)-5} more")
+            else:
+                print(f"\n[{label}] → non-list response: {str(data)[:200]}")
+    except Exception as e:
+        print(f"\n[{label}] ERROR: {e}")
 
 
 async def main():
-    # Calculate current and next 5-min timestamps
-    now = int(time.time())
-    current_5min = (now // 300) * 300
-    next_5min = current_5min + 300
+    async with aiohttp.ClientSession() as session:
 
-    print(f"Current time: {datetime.datetime.now(datetime.timezone.utc)}")
-    print(f"Current 5-min block: {current_5min}")
-    print(f"Next 5-min block: {next_5min}")
+        print("=" * 70)
+        print("STRATEGY 1: Search by keywords")
+        print("=" * 70)
+        for kw in ["5-minute", "5 minute", "5min", "BTC", "Bitcoin", "crypto"]:
+            await try_endpoint(session, GAMMA_URL, {
+                "_c": kw, "active": "true", "closed": "false", "limit": 5
+            }, f"keyword={kw}")
 
-    print("\n" + "=" * 60)
-    print("Searching for CURRENT 5-min market")
-    print("=" * 60)
-    await find_by_timestamp(current_5min)
+        print("\n" + "=" * 70)
+        print("STRATEGY 2: Search by tag")
+        print("=" * 70)
+        for tag in ["crypto", "bitcoin", "finance", "5-minute"]:
+            await try_endpoint(session, GAMMA_URL, {
+                "tag": tag, "active": "true", "closed": "false", "limit": 5
+            }, f"tag={tag}")
 
-    print("\n" + "=" * 60)
-    print("Searching for NEXT 5-min market")
-    print("=" * 60)
-    await find_by_timestamp(next_5min)
+        print("\n" + "=" * 70)
+        print("STRATEGY 3: Events endpoint")
+        print("=" * 70)
+        for kw in ["BTC", "Bitcoin", "5-minute"]:
+            await try_endpoint(session, GAMMA_EVENTS, {
+                "_c": kw, "active": "true", "closed": "false", "limit": 5
+            }, f"events keyword={kw}")
+
+        print("\n" + "=" * 70)
+        print("STRATEGY 4: Raw dump — first 20 active markets NO filter")
+        print("=" * 70)
+        await try_endpoint(session, GAMMA_URL, {
+            "active": "true", "closed": "false", "limit": 20
+        }, "no filter")
+
+        print("\n" + "=" * 70)
+        print("STRATEGY 5: Check if 5-min markets exist at all (including closed)")
+        print("=" * 70)
+        for kw in ["5-minute", "5 minute", "BTC up", "BTC down"]:
+            await try_endpoint(session, GAMMA_URL, {
+                "_c": kw, "limit": 5
+            }, f"no active filter, keyword={kw}")
+
+    print("\n" + "=" * 70)
+    print("DONE — paste the output above so we can fix market_finder.py")
+    print("=" * 70)
 
 
-if __name__ == "__main__":
-    asyncio.run(main())
+asyncio.run(main())
