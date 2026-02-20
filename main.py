@@ -1,655 +1,696 @@
 """
-main.py
-=======
-Polymarket Copy Trader with Bet URLs and Countdown Timers
+main.py - Polymarket Copy Trader with Persistent Memory + Manual Close
 """
 
 import asyncio
+import json
 import logging
 import os
+import re
 import sys
 import time
+import threading
 import requests
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional
 from datetime import datetime, timezone
-from collections import defaultdict
 
 import yaml
 from dotenv import load_dotenv
 
-from core.state import SharedState
-from core.binance_listener import BinanceListener
-from core.poly_book_listener import PolyBookListener
-from core.rtds_listener import RTDSListener
-from core.chainlink_listener import ChainlinkListener
-from core.market_finder import MarketFinder
-from core.executor import PolyExecutor
-from strategy.signal_engine import SignalEngine
-from strategy.taker_sniper import TakerSniper
-from strategy.maker_quoter import MakerQuoter
-from risk.position_manager import RiskManager
-from risk.fee_calculator import FeeCalculator
-from utils.logger import setup_logging
-from utils.metrics import MetricsTracker
-
 load_dotenv()
 
-
-def load_config(path: str = "config.yaml") -> dict:
+def load_config(path="config.yaml"):
     try:
-        with open(path) as f:
-            return yaml.safe_load(f)
-    except FileNotFoundError:
-        return {}
+        with open(path) as f: return yaml.safe_load(f)
+    except FileNotFoundError: return {}
 
-
-cfg = load_config()
-PAPER_TRADE = cfg.get("paper_trade", True)
-TRADING_MODE = cfg.get("strategy", {}).get("mode", "dual")
-LOG_LEVEL = cfg.get("log_level", "INFO")
+cfg      = load_config()
 LOG_FILE = cfg.get("log_file", "logs/bot.log")
-LOOP_MS = 0.05
 
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
+# ── CONFIG ───────────────────────────────────────────────────────────────────
+TARGET_WALLET   = "0x63ce342161250d705dc0b16df89036c8e5f9ba9a"
+DATA_API        = "https://data-api.polymarket.com"
+GAMMA_API       = "https://gamma-api.polymarket.com"
+STARTING_BUDGET = 100.0
+COPY_SCALE      = 0.5
+POLL_INTERVAL   = 5
+MEMORY_FILE     = "logs/trader_memory.json"
 
-TARGET_WALLET = "0x63ce342161250d705dc0b16df89036c8e5f9ba9a"
-TARGET_PROFILE = "https://polymarket.com/@0x8dxd"
-DATA_API = "https://data-api.polymarket.com"
-GAMMA_API = "https://gamma-api.polymarket.com"
+# ── COLORS ───────────────────────────────────────────────────────────────────
+class C:
+    R="\033[0m"; B="\033[1m"; CY="\033[96m"; MG="\033[95m"
+    GR="\033[92m"; RE="\033[91m"; YL="\033[93m"; BL="\033[94m"
+    WH="\033[97m"; GY="\033[90m"; OR="\033[38;5;208m"
 
-PAPER_BUDGET = 100.0
-COPY_SCALE = 0.5
+def _c(t,c): return f"{c}{t}{C.R}"
+def green(t):  return _c(t, C.GR)
+def red(t):    return _c(t, C.RE)
+def yel(t):    return _c(t, C.YL)
+def cyan(t):   return _c(t, C.CY)
+def gray(t):   return _c(t, C.GY)
+def bold(t):   return _c(t, C.B)
+def blue(t):   return _c(t, C.BL)
+def orange(t): return _c(t, C.OR)
+def mg(t):     return _c(t, C.MG)
+def pnlc(v,t): return green(t) if v >= 0 else red(t)
 
+def trunc(t, n): return t[:n-2]+".." if len(t) > n else t
 
-# ============================================================================
-# COLORS
-# ============================================================================
+def strip_ansi(t):
+    return re.sub(r'\033\[[0-9;]*m', '', t)
 
-class Colors:
-    RESET = "\033[0m"
-    BOLD = "\033[1m"
-    CYAN = "\033[96m"
-    MAGENTA = "\033[95m"
-    GREEN = "\033[92m"
-    RED = "\033[91m"
-    YELLOW = "\033[93m"
-    BLUE = "\033[94m"
-    WHITE = "\033[97m"
-    GRAY = "\033[90m"
-    ORANGE = "\033[38;5;208m"
+def pad(t, n, align='<'):
+    raw   = strip_ansi(t)
+    extra = len(t) - len(raw)
+    w     = n + extra
+    if align == '>': return t.rjust(w)
+    if align == '^': return t.center(w)
+    return t.ljust(w)
 
+# ── HELPERS ──────────────────────────────────────────────────────────────────
 
-# ============================================================================
-# HELPER FUNCTIONS
-# ============================================================================
-
-def format_time_remaining(end_date_str: str) -> str:
+def end_date_from_slug(slug: str) -> str:
     """
-    Format time remaining until market ends.
-    Returns: "2h 15m" or "45m" or "5m 30s" or "ENDED"
+    Extract end date directly from slug timestamp.
+    e.g. btc-updown-5m-1771595700  ->  2026-02-20T13:55:00+00:00
+    No API call needed — the timestamp IS the market close time.
     """
-    if not end_date_str:
-        return "Unknown"
+    m = re.search(r'-(\d{9,11})$', slug)
+    if m:
+        try:
+            ts = int(m.group(1))
+            dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+            return dt.isoformat()
+        except Exception:
+            pass
+    return ""
 
+def fetch_end_date_gamma(slug: str) -> str:
+    """Fallback: fetch end date from Gamma API."""
+    if not slug: return ""
     try:
-        # Parse end date (ISO format)
-        end_date = datetime.fromisoformat(end_date_str.replace('Z', '+00:00'))
-        now = datetime.now(timezone.utc)
-
-        if end_date <= now:
-            return f"{Colors.RED}ENDED{Colors.RESET}"
-
-        diff = end_date - now
-        total_seconds = int(diff.total_seconds())
-
-        days = total_seconds // 86400
-        hours = (total_seconds % 86400) // 3600
-        minutes = (total_seconds % 3600) // 60
-        seconds = total_seconds % 60
-
-        # Format based on time left
-        if days > 0:
-            return f"{Colors.YELLOW}{days}d {hours}h{Colors.RESET}"
-        elif hours > 0:
-            return f"{Colors.YELLOW}{hours}h {minutes}m{Colors.RESET}"
-        elif minutes > 0:
-            return f"{Colors.ORANGE}{minutes}m {seconds}s{Colors.RESET}"
-        else:
-            return f"{Colors.RED}{seconds}s{Colors.RESET}"
-
+        r = requests.get(
+            f"{GAMMA_API}/events",
+            params={"slug": slug},
+            timeout=5,
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
+        data = r.json()
+        if isinstance(data, list) and data:
+            # Try event-level endDate
+            ev = data[0]
+            if ev.get("endDate"): return ev["endDate"]
+            markets = ev.get("markets", [])
+            if markets: return markets[0].get("endDate", "")
     except Exception:
-        return "Unknown"
+        pass
+    return ""
 
+def get_end_date(slug: str, raw_end: str) -> str:
+    """Get best end date: from raw API > slug parse > Gamma fallback."""
+    if raw_end: return raw_end
+    from_slug = end_date_from_slug(slug)
+    if from_slug: return from_slug
+    return fetch_end_date_gamma(slug)
 
-def get_market_url(slug: str) -> str:
-    """Generate Polymarket URL from slug."""
-    if not slug:
-        return ""
-    return f"https://polymarket.com/event/{slug}"
+def time_left(end_str: str):
+    """Returns (colored string, total_seconds). -1 = expired."""
+    if not end_str: return gray("Unknown"), 0
+    try:
+        end = datetime.fromisoformat(end_str.replace('Z', '+00:00'))
+        now = datetime.now(timezone.utc)
+        if end <= now: return red("ENDED"), -1
+        tot = int((end - now).total_seconds())
+        d, rem = divmod(tot, 86400)
+        h, rem = divmod(rem, 3600)
+        m, s   = divmod(rem, 60)
+        if d > 0:   return yel(f"{d}d {h}h"), tot
+        elif h > 0: return yel(f"{h}h {m}m"), tot
+        elif m > 0: return orange(f"{m}m {s}s"), tot
+        else:       return red(f"{s}s"), tot
+    except Exception:
+        return gray("Unknown"), 0
 
+# ── MEMORY ───────────────────────────────────────────────────────────────────
 
-# ============================================================================
-# TRADE TRACKING WITH URL AND TIMER
-# ============================================================================
+def load_memory() -> dict:
+    os.makedirs("logs", exist_ok=True)
+    if os.path.exists(MEMORY_FILE):
+        try:
+            with open(MEMORY_FILE) as f:
+                data = json.load(f)
+            bal = data.get('balance', STARTING_BUDGET)
+            n   = len(data.get('closed_trades', []))
+            print(f"  {green('Memory loaded')}  balance={cyan(f'${bal:.2f}')}  "
+                  f"history={yel(str(n))} closed trades")
+            return data
+        except Exception as e:
+            print(f"  {red('Memory error')}: {e} — starting fresh")
+    return {}
+
+def save_memory(m: dict):
+    try:
+        with open(MEMORY_FILE, 'w') as f:
+            json.dump(m, f, indent=2)
+    except Exception as e:
+        logging.getLogger("memory").error(f"Save failed: {e}")
+
+# ── DATA CLASSES ─────────────────────────────────────────────────────────────
 
 @dataclass
-class Trade:
-    """Trade with URL and end date tracking."""
-    trade_id: str
+class Position:
+    key:          str
     market_title: str
-    outcome: str
-    slug: str
-
-    entry_price: float
-    entry_shares: float
+    outcome:      str
+    slug:         str
+    condition_id: str
+    entry_price:  float
+    cur_price:    float
+    shares:       float
     entry_amount: float
-
-    exit_price: float = 0.0
-    exit_amount: float = 0.0
-    realized_pnl: float = 0.0
-
-    is_open: bool = True
-    open_time: float = 0.0
-    close_time: Optional[float] = None
-    end_date: str = ""  # ISO format end date
+    cur_value:    float
+    end_date:     str
+    opened_at:    float = field(default_factory=time.time)
 
     @property
-    def market_url(self) -> str:
-        return get_market_url(self.slug)
+    def url(self):
+        return f"https://polymarket.com/event/{self.slug}" if self.slug else "N/A"
+    @property
+    def pnl(self):
+        return self.cur_value - self.entry_amount
+    @property
+    def roi_pct(self):
+        return ((self.cur_price - self.entry_price) / self.entry_price * 100) if self.entry_price > 0 else 0.0
+
+@dataclass
+class ClosedTrade:
+    key:          str
+    market_title: str
+    outcome:      str
+    slug:         str
+    entry_price:  float
+    exit_price:   float
+    entry_amount: float
+    exit_amount:  float
+    realized_pnl: float
+    closed_at:    float = field(default_factory=time.time)
+    reason:       str   = "closed"
 
     @property
-    def time_remaining(self) -> str:
-        return format_time_remaining(self.end_date)
+    def url(self):
+        return f"https://polymarket.com/event/{self.slug}" if self.slug else "N/A"
+    @property
+    def roi_pct(self):
+        return ((self.exit_price - self.entry_price) / self.entry_price * 100) if self.entry_price > 0 else 0.0
 
-    def calculate_pnl(self) -> float:
-        if self.is_open:
-            return (self.exit_price - self.entry_price) * self.entry_shares
-        else:
-            return self.realized_pnl
+    def to_dict(self):
+        return {
+            'key': self.key, 'market_title': self.market_title,
+            'outcome': self.outcome, 'slug': self.slug,
+            'entry_price': self.entry_price, 'exit_price': self.exit_price,
+            'entry_amount': self.entry_amount, 'exit_amount': self.exit_amount,
+            'realized_pnl': self.realized_pnl, 'closed_at': self.closed_at,
+            'reason': self.reason,
+        }
 
+    @classmethod
+    def from_dict(cls, d):
+        keys = ['key','market_title','outcome','slug','entry_price','exit_price',
+                'entry_amount','exit_amount','realized_pnl','closed_at','reason']
+        return cls(**{k: d[k] for k in keys if k in d})
 
-class BudgetCopyTrader:
-    """Copy trader with URL and timer support."""
+# ── COPY TRADER ──────────────────────────────────────────────────────────────
 
-    def __init__(self, wallet_address: str, budget: float = PAPER_BUDGET, copy_scale: float = COPY_SCALE):
-        self.wallet = wallet_address
-        self.budget = budget
-        self.copy_scale = copy_scale
+class CopyTrader:
+    def __init__(self, wallet: str, memory: dict):
+        self.wallet    = wallet
+        self.scale     = COPY_SCALE
+        self.available = memory.get('balance', STARTING_BUDGET)
+        self.invested  = memory.get('invested', 0.0)
+        self.returned  = memory.get('returned', 0.0)
+        self.realized  = memory.get('realized', 0.0)
+        self.session_start = self.available
+        self.closed_trades: List[ClosedTrade] = [
+            ClosedTrade.from_dict(d) for d in memory.get('closed_trades', [])
+        ]
+        self.positions:       Dict[str, Position] = {}
+        self._prev_target:    Dict[str, dict]     = {}
+        self.manual_queue:    List[str]            = []  # keys to manually close
 
         self.session = requests.Session()
-        self.session.headers.update({
-            'Accept': 'application/json',
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
-        })
+        self.session.headers.update({'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0'})
+        self.logger = logging.getLogger("trader")
 
-        # Budget tracking
-        self.invested = 0.0
-        self.available = budget
-        self.returned = 0.0
-        self.realized_profit = 0.0
+    @property
+    def budget(self):
+        return self.available + self.invested
 
-        # Positions and trades
-        self.target_positions: Dict[str, Dict] = {}
-        self.my_positions: Dict[str, Dict] = {}
-        self.all_trades: List[Trade] = []
-        self.open_trades: Dict[str, Trade] = {}
-
-        self.logger = logging.getLogger("budget_trader")
-
-    def fetch_target_positions(self) -> Dict[str, Dict]:
-        """Fetch positions with slug and end date."""
-        try:
-            url = f"{DATA_API}/positions"
-            params = {
-                "user": self.wallet,
-                "sizeThreshold": 0.1,
-                "limit": 500,
-            }
-
-            resp = self.session.get(url, params=params, timeout=15)
-            data = resp.json()
-
-            positions = {}
-            for pos in data:
-                condition_id = pos.get('conditionId', '')
-                outcome = pos.get('outcome', 'Unknown')
-                key = f"{condition_id}_{outcome}"
-
-                avg_price = float(pos.get('avgPrice', 0) or 0)
-                shares = float(pos.get('size', 0) or 0)
-                slug = pos.get('slug', '')
-                end_date = pos.get('endDate', '')
-
-                positions[key] = {
-                    'condition_id': condition_id,
-                    'market_title': pos.get('title', 'Unknown Market'),
-                    'outcome': outcome,
-                    'avg_price': avg_price,
-                    'cur_price': float(pos.get('curPrice', 0) or 0),
-                    'shares': shares,
-                    'entry_amount': avg_price * shares,
-                    'current_value': float(pos.get('currentValue', 0) or 0),
-                    'slug': slug,
-                    'market_url': get_market_url(slug),
-                    'end_date': end_date,
-                }
-
-            return positions
-
-        except Exception as e:
-            self.logger.error(f"Fetch error: {e}")
-            return self.target_positions
-
-    def sync_positions(self):
-        """Sync with budget constraints."""
-        actions = []
-
-        new_target = self.fetch_target_positions()
-
-        # OPEN new positions
-        for key, target_pos in new_target.items():
-            if key not in self.my_positions and key not in self.target_positions:
-                needed = target_pos['entry_amount'] * self.copy_scale
-
-                if needed <= self.available:
-                    action = self._open_position(target_pos, needed)
-                    actions.append(action)
-                else:
-                    actions.append(f"SKIP: {target_pos['market_title'][:25]} | "
-                                   f"Need ${needed:.2f}, have ${self.available:.2f}")
-
-        # UPDATE existing
-        for key, target_pos in new_target.items():
-            if key in self.my_positions:
-                self.my_positions[key]['cur_price'] = target_pos['cur_price']
-                self.my_positions[key]['current_value'] = target_pos['current_value'] * self.copy_scale
-
-                if key in self.open_trades:
-                    self.open_trades[key].exit_price = target_pos['cur_price']
-
-        # CLOSE positions
-        for key in list(self.my_positions.keys()):
-            if key not in new_target and key in self.target_positions:
-                action = self._close_position(key)
-                actions.append(action)
-
-        self.target_positions = new_target
-        return actions
-
-    def _open_position(self, target_pos: Dict, amount: float) -> str:
-        """Open position with URL and timer."""
-        our_shares = target_pos['shares'] * self.copy_scale
-
-        # Deduct from budget
-        self.available -= amount
-        self.invested += amount
-
-        position = {
-            'condition_id': target_pos['condition_id'],
-            'market_title': target_pos['market_title'],
-            'outcome': target_pos['outcome'],
-            'avg_price': target_pos['avg_price'],
-            'cur_price': target_pos['cur_price'],
-            'shares': our_shares,
-            'entry_amount': amount,
-            'current_value': target_pos['current_value'] * self.copy_scale,
-            'slug': target_pos['slug'],
-            'market_url': target_pos['market_url'],
-            'end_date': target_pos['end_date'],
-        }
-
-        key = f"{target_pos['condition_id']}_{target_pos['outcome']}"
-        self.my_positions[key] = position
-
-        # Track trade with URL and end date
-        trade = Trade(
-            trade_id=key,
-            market_title=target_pos['market_title'],
-            outcome=target_pos['outcome'],
-            slug=target_pos['slug'],
-            entry_price=target_pos['avg_price'],
-            entry_shares=our_shares,
-            entry_amount=amount,
-            exit_price=target_pos['cur_price'],
-            is_open=True,
-            open_time=time.time(),
-            end_date=target_pos['end_date']
-        )
-        self.open_trades[key] = trade
-        self.all_trades.append(trade)
-
-        # Format time remaining for display
-        time_left = format_time_remaining(target_pos['end_date'])
-
-        self.logger.info(f"OPENED: ${amount:.2f} | {position['market_title'][:40]} | "
-                         f"Time left: {time_left}")
-
-        return (f"OPEN: ${amount:.2f} | {position['market_title'][:25]} | "
-                f"Time: {time_left}")
-
-    def _close_position(self, key: str) -> str:
-        """Close position."""
-        if key not in self.my_positions:
-            return ""
-
-        pos = self.my_positions[key]
-
-        # Calculate return
-        exit_value = pos['cur_price'] * pos['shares']
-        profit = exit_value - pos['entry_amount']
-
-        # Return to budget
-        self.invested -= pos['entry_amount']
-        self.available += exit_value
-        self.returned += exit_value
-        self.realized_profit += profit
-
-        # Update trade
-        if key in self.open_trades:
-            trade = self.open_trades[key]
-            trade.is_open = False
-            trade.close_time = time.time()
-            trade.exit_amount = exit_value
-            trade.realized_pnl = profit
-
-        del self.open_trades[key]
-        del self.my_positions[key]
-
-        return (f"CLOSE: ${pos['entry_amount']:.2f} → ${exit_value:.2f} | "
-                f"Profit: ${profit:+.2f}")
-
-    def get_budget_summary(self) -> Dict:
-        """Get budget summary."""
-        unrealized = sum(
-            (p['cur_price'] - p['avg_price']) * p['shares']
-            for p in self.my_positions.values()
-        )
-
+    def to_memory(self):
         return {
-            'budget': self.budget,
-            'invested': self.invested,
-            'available': self.available,
-            'returned': self.returned,
-            'realized_profit': self.realized_profit,
-            'unrealized_pnl': unrealized,
-            'total_value': self.available + sum(p['current_value'] for p in self.my_positions.values()),
-            'positions': len(self.my_positions),
+            'balance':      self.available,
+            'invested':     self.invested,
+            'returned':     self.returned,
+            'realized':     self.realized,
+            'closed_trades': [t.to_dict() for t in self.closed_trades[-500:]],
+            'saved_at':     datetime.now().isoformat(),
         }
 
+    def _fetch_raw(self) -> Dict[str, dict]:
+        try:
+            r = self.session.get(
+                f"{DATA_API}/positions",
+                params={"user": self.wallet, "sizeThreshold": 0.01, "limit": 500},
+                timeout=15,
+            )
+            r.raise_for_status()
+            out = {}
+            for p in r.json():
+                cid = p.get('conditionId', '')
+                oc  = p.get('outcome', 'Unknown')
+                key = f"{cid}_{oc}"
+                # Try all possible end date field names
+                raw_end = (p.get('endDate') or p.get('end_date') or
+                           p.get('endDateIso') or p.get('expirationDate') or '')
+                slug = p.get('slug', '')
+                out[key] = {
+                    'condition_id':  cid,
+                    'market_title':  p.get('title', 'Unknown'),
+                    'outcome':       oc,
+                    'avg_price':     float(p.get('avgPrice', 0) or 0),
+                    'cur_price':     float(p.get('curPrice', 0) or 0),
+                    'shares':        float(p.get('size', 0) or 0),
+                    'current_value': float(p.get('currentValue', 0) or 0),
+                    'slug':          slug,
+                    'end_date':      get_end_date(slug, raw_end),
+                }
+            return out
+        except Exception as e:
+            self.logger.error(f"Fetch: {e}")
+            return self._prev_target
 
-# ============================================================================
-# DASHBOARD WITH URLS AND TIMERS
-# ============================================================================
+    def _do_close(self, key: str, reason: str = "closed") -> Optional[ClosedTrade]:
+        if key not in self.positions:
+            return None
+        pos = self.positions[key]
+        exit_val = pos.cur_price * pos.shares
+        profit   = exit_val - pos.entry_amount
+        self.available       += exit_val
+        self.invested         = max(0.0, self.invested - pos.entry_amount)
+        self.returned        += exit_val
+        self.realized        += profit
+        ct = ClosedTrade(
+            key=key, market_title=pos.market_title, outcome=pos.outcome,
+            slug=pos.slug, entry_price=pos.entry_price, exit_price=pos.cur_price,
+            entry_amount=pos.entry_amount, exit_amount=exit_val,
+            realized_pnl=profit, reason=reason,
+        )
+        self.closed_trades.append(ct)
+        del self.positions[key]
+        return ct
 
-class BudgetDashboard:
-    """Dashboard with bet URLs and countdown timers."""
+    def close_all(self, reason: str = "shutdown") -> List[ClosedTrade]:
+        return [ct for key in list(self.positions.keys())
+                for ct in [self._do_close(key, reason)] if ct]
 
-    def __init__(self):
-        self.width = 110  # Wider for URLs
-        self.start_time = time.time()
-        self.last_actions = []
+    def sync(self) -> List[tuple]:
+        events  = []
+        current = self._fetch_raw()
 
-        self._clear()
-        sys.stdout.write("\033[?25l")
-        sys.stdout.flush()
+        # ── NEW positions ────────────────────────────────────────────────
+        for key, raw in current.items():
+            if key not in self._prev_target:
+                needed = raw['avg_price'] * raw['shares'] * self.scale
+                if needed < 0.01:
+                    continue
+                if needed > self.available:
+                    events.append(("skip",
+                        f"SKIP {trunc(raw['market_title'], 35)} | "
+                        f"Need ${needed:.2f}, have ${self.available:.2f}"))
+                    continue
+                our_shares = raw['shares'] * self.scale
+                self.available -= needed
+                self.invested  += needed
+                pos = Position(
+                    key=key, market_title=raw['market_title'],
+                    outcome=raw['outcome'], slug=raw['slug'],
+                    condition_id=raw['condition_id'],
+                    entry_price=raw['avg_price'], cur_price=raw['cur_price'],
+                    shares=our_shares, entry_amount=needed,
+                    cur_value=raw['current_value'] * self.scale,
+                    end_date=raw['end_date'],
+                )
+                self.positions[key] = pos
+                tl, _ = time_left(pos.end_date)
+                events.append(("new",
+                    f"NEW BET  {raw['market_title']}\n"
+                    f"         Side={raw['outcome']}  "
+                    f"Entry=${raw['avg_price']:.4f}  "
+                    f"Invested=${needed:.2f} ({our_shares:.1f} shares)\n"
+                    f"         Time Left={tl}\n"
+                    f"         URL={pos.url}"))
+                self.logger.info(
+                    f"COPIED: {raw['market_title']} | {raw['outcome']} | ${needed:.2f}")
 
-    def _clear(self):
-        os.system('cls' if os.name == 'nt' else 'clear')
+        # ── UPDATE + AUTO-CLOSE ──────────────────────────────────────────
+        for key, pos in list(self.positions.items()):
+            if key in current:
+                pos.cur_price = current[key]['cur_price']
+                pos.cur_value = current[key]['current_value'] * self.scale
+                # Refresh end_date if still missing
+                if not pos.end_date and pos.slug:
+                    pos.end_date = get_end_date(pos.slug, '')
+                # Auto-close expired
+                _, secs = time_left(pos.end_date)
+                if secs == -1:
+                    ct = self._do_close(key, reason="expired")
+                    if ct:
+                        events.append(("close",
+                            f"EXPIRED  {pos.market_title}\n"
+                            f"         Side={pos.outcome}  "
+                            f"Profit=${ct.realized_pnl:+.2f}  ROI={ct.roi_pct:+.1f}%"))
+            elif key in self._prev_target:
+                # Target closed — we close too
+                ct = self._do_close(key, reason="closed")
+                if ct:
+                    events.append(("close",
+                        f"TARGET CLOSED  {pos.market_title}\n"
+                        f"               Side={pos.outcome}  "
+                        f"Profit=${ct.realized_pnl:+.2f}  ROI={ct.roi_pct:+.1f}%"))
 
-    def _print(self, row: int, text: str, col: int = 0):
-        sys.stdout.write(f"\033[{row};{col}H{text}")
+        # ── MANUAL CLOSE ────────────────────────────────────────────────
+        for key in list(self.manual_queue):
+            if key in self.positions:
+                pos = self.positions[key]
+                ct  = self._do_close(key, reason="manual")
+                if ct:
+                    events.append(("close",
+                        f"MANUAL CLOSE  {pos.market_title}\n"
+                        f"              Side={pos.outcome}  "
+                        f"Profit=${ct.realized_pnl:+.2f}  ROI={ct.roi_pct:+.1f}%"))
+        self.manual_queue.clear()
 
-    def _format_time(self, seconds):
-        hours = int(seconds // 3600)
-        minutes = int((seconds % 3600) // 60)
-        secs = int(seconds % 60)
-        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+        self._prev_target = current
+        return events
 
-    def _bar(self, current: float, max_val: float, width: int = 30) -> str:
-        if max_val == 0:
-            return "░" * width
-        filled = int((current / max_val) * width)
-        return "█" * filled + "░" * (width - filled)
+    def summary(self):
+        unreal = sum(p.pnl for p in self.positions.values())
+        total_val = self.available + sum(p.cur_value for p in self.positions.values())
+        return {
+            'budget':       self.budget,
+            'available':    self.available,
+            'invested':     self.invested,
+            'returned':     self.returned,
+            'realized':     self.realized,
+            'unrealized':   unreal,
+            'value':        total_val,
+            'n_open':       len(self.positions),
+            'n_closed':     len(self.closed_trades),
+            'session_start':self.session_start,
+        }
 
-    def _truncate_url(self, url: str, max_len: int = 40) -> str:
-        """Truncate URL for display."""
-        if len(url) <= max_len:
-            return url
-        return url[:max_len - 3] + "..."
+# ── DASHBOARD ────────────────────────────────────────────────────────────────
 
-    def update(self, trader: BudgetCopyTrader):
-        """Render dashboard with URLs and timers."""
-        now = time.time()
-        uptime = now - self.start_time
+W = 122
 
-        summary = trader.get_budget_summary()
-        my_positions = list(trader.my_positions.values())
-        closed_trades = [t for t in trader.all_trades if not t.is_open][-5:]
+def div(n=None): return gray("─" * (n or W - 4))
 
-        lines = []
+def render(trader: CopyTrader, start_time: float, alerts: List[str]):
+    s  = trader.summary()
+    ps = sorted(trader.positions.values(), key=lambda p: p.entry_amount, reverse=True)
+    ct = trader.closed_trades[-6:]
+    up = time.time() - start_time
+    h  = int(up // 3600)
+    m  = int((up % 3600) // 60)
+    sc = int(up % 60)
 
-        # Header
-        lines.append(f"{Colors.CYAN}{'═' * self.width}{Colors.RESET}")
-        lines.append(
-            f"{Colors.BOLD}{Colors.WHITE}  POLYMARKET COPY TRADER - $100 BUDGET + URLs & TIMERS{Colors.RESET}  {Colors.GREEN}● LIVE{Colors.RESET}")
-        lines.append(f"{Colors.CYAN}{'═' * self.width}{Colors.RESET}")
-        lines.append("")
+    pct    = s['invested'] / s['budget'] * 100 if s['budget'] else 0
+    bar_w  = 25
+    filled = int(pct / 100 * bar_w)
+    bar    = C.YL + "█" * filled + C.GY + "░" * (bar_w - filled) + C.R
+    spnl   = s['available'] - s['session_start']
 
-        # BUDGET BREAKDOWN
-        lines.append(f"{Colors.GREEN}{Colors.BOLD}  ▼ YOUR $100 BUDGET{Colors.RESET}")
-        lines.append(f"{Colors.GRAY}  {'─' * 80}{Colors.RESET}")
+    bgt = bold(f"${s['budget']:.2f}")
+    avl = green(f"${s['available']:.2f}")
+    inv = yel(f"${s['invested']:.2f}")
+    ret = blue(f"${s['returned']:.2f}")
+    val = cyan(f"${s['value']:.2f}")
+    rlz = pnlc(s['realized'],   f"${s['realized']:+.2f}")
+    unr = pnlc(s['unrealized'], f"${s['unrealized']:+.2f}")
+    sp  = pnlc(spnl,            f"${spnl:+.2f}")
 
-        invested_pct = (summary['invested'] / summary['budget']) * 100
-        bar = self._bar(summary['invested'], summary['budget'])
+    # Column widths
+    CM, CS, CE, CN, CI, CP, CR, CT = 28, 5, 8, 8, 8, 10, 7, 12
 
-        lines.append(f"  Total Budget:      {Colors.BOLD}{Colors.WHITE}${summary['budget']:.2f}{Colors.RESET}")
-        lines.append(f"")
-        lines.append(
-            f"  {Colors.YELLOW}INVESTED:{Colors.RESET}          {Colors.YELLOW}${summary['invested']:.2f}{Colors.RESET} ({invested_pct:.1f}%)  {bar}")
-        lines.append(f"  {Colors.GREEN}AVAILABLE:         ${summary['available']:.2f}{Colors.RESET}")
-        lines.append(f"  {Colors.BLUE}CASH RETURNED:     ${summary['returned']:.2f}{Colors.RESET}")
-        lines.append(f"")
+    L = []
 
-        realized_color = Colors.GREEN if summary['realized_profit'] >= 0 else Colors.RED
-        unreal_color = Colors.GREEN if summary['unrealized_pnl'] >= 0 else Colors.RED
+    # Header
+    L += [
+        f"{C.CY}╔{'═'*(W-2)}╗{C.R}",
+        (f"{C.CY}║{C.R}  {bold('POLYMARKET COPY TRADER  ─  PAPER MODE'):<46}"
+         f"  uptime {gray(f'{h:02d}:{m:02d}:{sc:02d}')}"
+         f"  {yel(TARGET_WALLET[:20]+'...')}"
+         f"  {C.CY}║{C.R}"),
+        f"{C.CY}╚{'═'*(W-2)}╝{C.R}", "",
+    ]
 
-        lines.append(f"  Realized Profit:   {realized_color}${summary['realized_profit']:+.2f}{Colors.RESET}")
-        lines.append(f"  Unrealized P&L:    {unreal_color}${summary['unrealized_pnl']:+.2f}{Colors.RESET}")
-        lines.append(f"  Portfolio Value:   {Colors.CYAN}${summary['total_value']:.2f}{Colors.RESET}")
-        lines.append("")
+    # Budget
+    L += [
+        f"  {green('▼ BUDGET')}",
+        f"  {div(80)}",
+        f"  Portfolio {bgt}   Available {avl}   Invested {inv} ({pct:.0f}%)  {bar}",
+        f"  Realized  {rlz}   Unrealized {unr}   Returned {ret}   Session {sp}",
+        "",
+    ]
 
-        # Target Info
-        lines.append(f"{Colors.MAGENTA}  ▼ TARGET WALLET{Colors.RESET}")
-        lines.append(f"{Colors.GRAY}  {'─' * 80}{Colors.RESET}")
-        lines.append(f"  Wallet:  {Colors.YELLOW}{TARGET_WALLET[:25]}...{Colors.RESET}")
-        lines.append(f"  Profile: {Colors.BLUE}{TARGET_PROFILE}{Colors.RESET}")
-        lines.append(f"  Copy Scale: {Colors.YELLOW}50%{Colors.RESET}")
-        lines.append("")
+    # Open positions table
+    close_hint = gray("type number + Enter to close")
+    L += [
+        f"  {C.YL}▼ OPEN POSITIONS  ({s['n_open']})  {close_hint}{C.R}",
+        f"  {div()}",
+        (f"  {bold('#'):>4} "
+         f"{bold('Market'):<{CM}} "
+         f"{bold('Side'):>{CS}} "
+         f"{bold('Entry'):>{CE}} "
+         f"{bold('Now'):>{CN}} "
+         f"{bold('In$'):>{CI}} "
+         f"{bold('P&L'):>{CP}} "
+         f"{bold('ROI'):>{CR}} "
+         f"{bold('Time Left'):>{CT}}  "
+         f"{bold('Full Bet URL')}"),
+        f"  {div()}",
+    ]
 
-        # OPEN POSITIONS WITH URLS AND TIMERS
-        lines.append(f"{Colors.YELLOW}  ▼ YOUR POSITIONS (With Bet URLs & Time Remaining){Colors.RESET}")
-        lines.append(f"{Colors.GRAY}  {'─' * 105}{Colors.RESET}")
+    if ps:
+        for i, p in enumerate(ps[:10]):
+            tl_str, _ = time_left(p.end_date)
+            roi_val   = p.roi_pct
+            roi_str   = pnlc(roi_val, f"{roi_val:+.1f}%")
+            pnl_str   = pnlc(p.pnl,  f"${p.pnl:+.2f}")
+            side_c    = green(p.outcome) if p.outcome.lower() in ("yes","up") else red(p.outcome)
+            num_c     = cyan(f"[{i}]")
+            L.append(
+                f"  {pad(num_c, 4, '>')} "
+                f"{trunc(p.market_title, CM):<{CM}} "
+                f"{pad(side_c,  CS, '>')} "
+                f"{pad(gray(f'${p.entry_price:.3f}'), CE, '>')} "
+                f"{pad(cyan(f'${p.cur_price:.3f}'),   CN, '>')} "
+                f"{pad(yel(f'${p.entry_amount:.2f}'), CI, '>')} "
+                f"{pad(pnl_str, CP, '>')} "
+                f"{pad(roi_str, CR, '>')} "
+                f"{pad(tl_str,  CT, '>')}  "
+                f"{blue(p.url)}"
+            )
+    else:
+        L.append(f"  {gray('No open positions.')}")
+    L.append("")
 
-        if my_positions:
-            # Header
-            lines.append(
-                f"  {Colors.BOLD}{'Market':<25} {'Inv $':>8} {'P&L $':>9} {'Time Left':>12} {'Bet URL':<45}{Colors.RESET}")
-            lines.append(f"  {Colors.GRAY}{'─' * 105}{Colors.RESET}")
+    # Closed trades table
+    L += [
+        f"  {C.GR}▼ CLOSED TRADES  ({s['n_closed']} total){C.R}",
+        f"  {div()}",
+        (f"  {bold('Market'):<{CM}} "
+         f"{bold('Side'):>{CS}} "
+         f"{bold('Entry'):>{CE}} "
+         f"{bold('Exit'):>{CN}} "
+         f"{bold('In$'):>{CI}} "
+         f"{bold('Out$'):>{CP}} "
+         f"{bold('Profit'):>{CR}} "
+         f"{bold('ROI'):>7}  "
+         f"{bold('How'):<8}  "
+         f"{bold('Full Bet URL')}"),
+        f"  {div()}",
+    ]
 
-            for pos in sorted(my_positions, key=lambda p: p['entry_amount'], reverse=True)[:6]:
-                pnl = (pos['cur_price'] - pos['avg_price']) * pos['shares']
-                pnl_color = Colors.GREEN if pnl >= 0 else Colors.RED
+    if ct:
+        for t in reversed(ct):
+            roi_str = pnlc(t.roi_pct,      f"{t.roi_pct:+.1f}%")
+            pnl_str = pnlc(t.realized_pnl, f"${t.realized_pnl:+.2f}")
+            side_c  = green(t.outcome) if t.outcome.lower() in ("yes","up") else red(t.outcome)
+            rsn_c   = (orange(t.reason) if t.reason == "manual"
+                       else red(t.reason)    if t.reason == "expired"
+                       else gray(t.reason))
+            L.append(
+                f"  {trunc(t.market_title, CM):<{CM}} "
+                f"{pad(side_c,  CS, '>')} "
+                f"{pad(gray(f'${t.entry_price:.3f}'), CE, '>')} "
+                f"{pad(cyan(f'${t.exit_price:.3f}'),  CN, '>')} "
+                f"{pad(yel(f'${t.entry_amount:.2f}'), CI, '>')} "
+                f"{pad(cyan(f'${t.exit_amount:.2f}'), CP, '>')} "
+                f"{pad(pnl_str, CR, '>')} "
+                f"{pad(roi_str, 7,  '>')}  "
+                f"{rsn_c:<8}  "
+                f"{blue(t.url)}"
+            )
+    else:
+        L.append(f"  {gray('No closed trades yet.')}")
+    L.append("")
 
-                market_name = pos['market_title'][:24] if len(pos['market_title']) <= 25 else pos['market_title'][
-                                                                                                  :22] + ".."
-                time_left = format_time_remaining(pos['end_date'])
-                url = self._truncate_url(pos['market_url'], 45)
+    # Alerts
+    L += [f"  {orange('▼ ALERTS')}", f"  {div(80)}"]
+    if alerts:
+        for a in alerts[-6:]:
+            c = (C.GR if "NEW" in a
+                 else C.RE if any(x in a for x in ("CLOSED","EXPIRED","MANUAL"))
+                 else C.YL)
+            L.append(f"  {c}{a}{C.R}")
+    else:
+        L.append(f"  {gray('Monitoring target wallet...')}")
+    L.append("")
+    L.append(
+        f"  {gray('Refreshes every')} {yel(str(POLL_INTERVAL)+'s')} "
+        f"{gray('|')} {mg('Type position [number] + Enter to close it')} "
+        f"{gray('| Ctrl+C = close all + save')}"
+    )
 
-                lines.append(f"  {market_name:<25} "
-                             f"{Colors.YELLOW}${pos['entry_amount']:>7.2f}{Colors.RESET} "
-                             f"{pnl_color}${pnl:>+8.2f}{Colors.RESET} "
-                             f"{time_left:>12} "
-                             f"{Colors.BLUE}{url}{Colors.RESET}")
-        else:
-            lines.append(f"  {Colors.GRAY}No positions - $100 available{Colors.RESET}")
+    os.system('cls' if os.name == 'nt' else 'clear')
+    print("\n".join(L))
+    sys.stdout.flush()
 
-        lines.append("")
+# ── INPUT THREAD ─────────────────────────────────────────────────────────────
 
-        # CLOSED TRADES
-        lines.append(f"{Colors.GREEN}  ▼ CLOSED TRADES (Completed Bets){Colors.RESET}")
-        lines.append(f"{Colors.GRAY}  {'─' * 105}{Colors.RESET}")
-
-        if closed_trades:
-            lines.append(
-                f"  {Colors.BOLD}{'Market':<30} {'Inv $':>8} {'Ret $':>8} {'Profit':>9} {'Bet URL':<50}{Colors.RESET}")
-            lines.append(f"  {Colors.GRAY}{'─' * 105}{Colors.RESET}")
-
-            for trade in reversed(closed_trades):
-                pnl_color = Colors.GREEN if trade.realized_pnl >= 0 else Colors.RED
-                # FIXED LINE HERE - removed extra quote
-                market_name = trade.market_title[:29] if len(trade.market_title) <= 30 else trade.market_title[
-                                                                                                :27] + ".."
-                url = self._truncate_url(trade.market_url, 50)
-
-                lines.append(f"  {market_name:<30} "
-                             f"{Colors.YELLOW}${trade.entry_amount:>7.2f}{Colors.RESET} "
-                             f"{Colors.CYAN}${trade.exit_amount:>7.2f}{Colors.RESET} "
-                             f"{pnl_color}${trade.realized_pnl:>+8.2f}{Colors.RESET} "
-                             f"{Colors.BLUE}{url}{Colors.RESET}")
-        else:
-            lines.append(f"  {Colors.GRAY}No closed trades yet{Colors.RESET}")
-
-                lines.append("")
-                # Recent Activity
-                lines.append(f"{Colors.ORANGE}  ▼ RECENT ACTIVITY{Colors.RESET}")
-                lines.append(f"{Colors.GRAY}  {'─' * 80}{Colors.RESET}")
-
-                if self.last_actions:
-                    for
-                action in self.last_actions[-5:]:
-                if "OPEN" in action:
-                    color = Colors.GREEN
-                elif "CLOSE" in action:
-                    color = Colors.RED
-                elif "SKIP" in action:
-                    color = Colors.YELLOW
+def input_thread_fn(trader: CopyTrader):
+    """Background thread: reads input for manual close commands."""
+    while True:
+        try:
+            line = input().strip()
+            if line.isdigit():
+                idx = int(line)
+                ps  = list(trader.positions.values())
+                if 0 <= idx < len(ps):
+                    key = ps[idx].key
+                    trader.manual_queue.append(key)
+                    print(f"\n  {orange(f'Queued manual close for [{idx}] {trunc(ps[idx].market_title, 40)}')}")
                 else:
-                    color = Colors.WHITE
-                lines.append(f"  {color}{action}{Colors.RESET}")
-                else:
-                lines.append(f"  {Colors.GRAY}No activity{Colors.RESET}")
+                    print(f"\n  {red(f'Invalid: [{idx}] — valid range is 0-{len(ps)-1}')}")
+        except (EOFError, KeyboardInterrupt):
+            break
+        except Exception:
+            pass
 
-                lines.append("")
-                lines.append(f"{Colors.CYAN}{'═' * self.width}{Colors.RESET}")
-                lines.append(
-                    f"  {Colors.GRAY}Uptime: {self._format_time(uptime)} | Updates every 10s | Ctrl+C to stop{Colors.RESET}")
+# ── LOGGING ──────────────────────────────────────────────────────────────────
 
-                # Render
-                self._clear()
-                for i, line in enumerate(lines):
-                    self._print(i + 1, line, 0)
+def setup_logging():
+    os.makedirs("logs", exist_ok=True)
+    fh = logging.FileHandler(LOG_FILE, mode='a', encoding='utf-8')
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(name)s: %(message)s'))
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG)
+    for h in list(root.handlers):
+        if not isinstance(h, logging.FileHandler):
+            root.removeHandler(h)
+    root.addHandler(fh)
 
-                sys.stdout.flush()
-
-    def add_action(self, action: str):
-        timestamp = datetime.now().strftime('%H:%M:%S')
-        self.last_actions.append(f"[{timestamp}] {action}")
-        if len(self.last_actions) > 10:
-            self.last_actions = self.last_actions[-10:]
-
-    def close(self):
-        sys.stdout.write("\033[?25h")
-        sys.stdout.flush()
-
-
-# ============================================================================
-# LOGGING
-# ============================================================================
-
-def setup_logging(level: str, log_file: str):
-    os.makedirs(os.path.dirname(log_file) if os.path.dirname(log_file) else "logs", exist_ok=True)
-
-    file_handler = logging.FileHandler(log_file, mode='a', encoding='utf-8')
-    file_handler.setLevel(logging.DEBUG)
-    formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(name)s: %(message)s')
-    file_handler.setFormatter(formatter)
-
-    root_logger = logging.getLogger()
-    root_logger.setLevel(logging.DEBUG)
-    root_logger.addHandler(file_handler)
-
-    for handler in list(root_logger.handlers):
-        if isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler):
-            root_logger.removeHandler(handler)
-
-
-# ============================================================================
-# MAIN
-# ============================================================================
+# ── MAIN ─────────────────────────────────────────────────────────────────────
 
 async def main():
-    setup_logging(LOG_LEVEL, LOG_FILE)
-    logger = logging.getLogger("main")
+    # Enable ANSI on Windows
+    try:
+        import ctypes
+        ctypes.windll.kernel32.SetConsoleMode(
+            ctypes.windll.kernel32.GetStdHandle(-11), 7)
+    except Exception:
+        pass
 
-    print(f"\n{Colors.CYAN}{'═' * 70}{Colors.RESET}")
-    print(f"{Colors.BOLD}{Colors.WHITE}  POLYMARKET COPY TRADER - URLs & TIMERS{Colors.RESET}")
-    print(f"{Colors.CYAN}{'═' * 70}{Colors.RESET}")
-    print(f"\n  {Colors.GREEN}PAPER TRADING MODE{Colors.RESET} | Budget: {Colors.BOLD}$100.00{Colors.RESET}")
-    print(f"  Copy Scale: {Colors.YELLOW}50%{Colors.RESET}")
-    print(f"")
-    print(f"  {Colors.GRAY}Features:{Colors.RESET}")
-    print(f"  • Shows Polymarket bet URL for each position")
-    print(f"  • Countdown timer showing time until market ends")
-    print(f"  • Tracks your $100 budget in real-time")
-    print(f"\n{Colors.CYAN}{'═' * 70}{Colors.RESET}\n")
+    setup_logging()
+    logger     = logging.getLogger("main")
+    start_time = time.time()
+    alerts: List[str] = []
 
-    dashboard = BudgetDashboard()
-    trader = BudgetCopyTrader(TARGET_WALLET, budget=PAPER_BUDGET, copy_scale=COPY_SCALE)
+    memory = load_memory()
+    trader = CopyTrader(TARGET_WALLET, memory)
 
-    print(f"{Colors.YELLOW}Fetching target positions...{Colors.RESET}")
-    trader.fetch_target_positions()
-    print(f"  Target has {Colors.WHITE}{len(trader.target_positions)}{Colors.RESET} positions")
+    bal_s = cyan(f"${trader.available:.2f}")
+    hist  = yel(str(len(trader.closed_trades)))
+    print(f"\n  {bold('POLYMARKET COPY TRADER')}")
+    print(f"  Balance: {bal_s}   History: {hist} closed trades\n")
 
-    print(f"\n{Colors.YELLOW}Copying positions with URLs and timers...{Colors.RESET}")
-    actions = trader.sync_positions()
-    for action in actions:
-        dashboard.add_action(action)
-        print(f"  {action}")
+    # Snapshot existing positions WITHOUT copying them
+    raw = trader._fetch_raw()
+    trader._prev_target = raw
+    n_missing = sum(1 for v in raw.values() if not v.get('end_date'))
+    print(f"  Target has {C.WH}{len(raw)}{C.R} existing positions "
+          f"({gray(str(n_missing)+' missing end_date')})")
+    print(f"  {green('Watching for NEW bets...')}\n")
+    await asyncio.sleep(2)
 
-    print(f"\n{Colors.GREEN}Budget: ${trader.available:.2f} available / $100.00 total{Colors.RESET}")
-    print(f"\n{Colors.GREEN}Starting monitoring...{Colors.RESET}\n")
+    # Start background input thread for manual closes
+    t = threading.Thread(target=input_thread_fn, args=(trader,), daemon=True)
+    t.start()
 
     try:
         while True:
-            actions = trader.sync_positions()
-            for action in actions:
-                dashboard.add_action(action)
+            events = trader.sync()
 
-            dashboard.update(trader)
+            for kind, msg in events:
+                ts = datetime.now().strftime('%H:%M:%S')
+                alerts.append(f"[{ts}] {msg.split(chr(10))[0]}")
+                alerts = alerts[-20:]
+                logger.info(msg.replace('\n', ' | '))
 
-            await asyncio.sleep(10)
+                # Flash full message before next render
+                if kind in ("new", "close"):
+                    c = C.GR if kind == "new" else C.RE
+                    print(f"\n{c}{'─'*65}{C.R}")
+                    for line in msg.split('\n'):
+                        print(f"{c}{line}{C.R}")
+                    print(f"{c}{'─'*65}{C.R}\n")
+                    if kind == "new":
+                        await asyncio.sleep(3)
+
+            save_memory(trader.to_memory())
+            render(trader, start_time, alerts)
+            await asyncio.sleep(POLL_INTERVAL)
 
     except KeyboardInterrupt:
-        print(f"\n{Colors.YELLOW}Shutting down...{Colors.RESET}")
-    finally:
-        dashboard.close()
+        print(f"\n{C.YL}Shutting down — closing all positions at current price...{C.R}")
+        closed = trader.close_all(reason="shutdown")
+        for ct in closed:
+            pnl_s = pnlc(ct.realized_pnl, f"${ct.realized_pnl:+.2f}")
+            print(f"  Closed: {trunc(ct.market_title, 45)} | {pnl_s}")
+            logger.info(f"SHUTDOWN: {ct.market_title} | ${ct.realized_pnl:+.2f}")
 
-        summary = trader.get_budget_summary()
-        print(f"\n{Colors.CYAN}{'═' * 70}{Colors.RESET}")
-        print(f"{Colors.BOLD}FINAL BUDGET REPORT{Colors.RESET}")
-        print(f"{Colors.CYAN}{'═' * 70}{Colors.RESET}")
-        print(f"Started with:      ${summary['budget']:.2f}")
-        print(f"Currently Invested: ${summary['invested']:.2f}")
-        print(f"Available Cash:    ${summary['available']:.2f}")
-        print(
-            f"Realized Profit:   {Colors.GREEN if summary['realized_profit'] >= 0 else Colors.RED}${summary['realized_profit']:+.2f}{Colors.RESET}")
-        print(
-            f"Unrealized P&L:    {Colors.GREEN if summary['unrealized_pnl'] >= 0 else Colors.RED}${summary['unrealized_pnl']:+.2f}{Colors.RESET}")
-        print(f"Portfolio Value:   {Colors.CYAN}${summary['total_value']:.2f}{Colors.RESET}")
-        print(f"{Colors.CYAN}{'═' * 70}{Colors.RESET}")
+        save_memory(trader.to_memory())
+        s    = trader.summary()
+        spnl = s['available'] - trader.session_start
+
+        avl_f  = green(f"${s['available']:.2f}")
+        bgt_f  = cyan(f"${s['budget']:.2f}")
+        sp_f   = pnlc(spnl, f"${spnl:+.2f}")
+        rlz_f  = pnlc(s['realized'], f"${s['realized']:+.2f}")
+        ncl_f  = yel(str(s['n_closed']))
+        nxt_f  = cyan(f"${s['available']:.2f}")
+
+        print(f"\n{'─'*55}")
+        print(bold("FINAL REPORT  (memory saved)"))
+        print(f"{'─'*55}")
+        print(f"Portfolio:    {bgt_f}")
+        print(f"Available:    {avl_f}")
+        print(f"Session P&L:  {sp_f}")
+        print(f"All Realized: {rlz_f}")
+        print(f"Trades closed:{ncl_f}")
+        print(f"\n{green('Next run starts with')} {nxt_f}")
 
 
 if __name__ == "__main__":
