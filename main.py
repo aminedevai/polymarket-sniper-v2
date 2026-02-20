@@ -1,10 +1,7 @@
 """
 main.py
 =======
-Polymarket Sniper v2 - FULL COPY TRADING
-Copies ALL positions from target wallet across ALL markets
-Target: 0x63ce342161250d705dc0b16df89036c8e5f9ba9a
-Profile: https://polymarket.com/@0x8dxd
+Polymarket Copy Trader with Bet URLs and Countdown Timers
 """
 
 import asyncio
@@ -13,9 +10,9 @@ import os
 import sys
 import time
 import requests
-from dataclasses import dataclass
-from typing import List, Dict, Optional, Any, Tuple
-from datetime import datetime
+from dataclasses import dataclass, field
+from typing import List, Dict, Optional, Any
+from datetime import datetime, timezone
 from collections import defaultdict
 
 import yaml
@@ -55,7 +52,7 @@ LOG_FILE = cfg.get("log_file", "logs/bot.log")
 LOOP_MS = 0.05
 
 # ============================================================================
-# TARGET WALLET CONFIGURATION
+# CONFIGURATION
 # ============================================================================
 
 TARGET_WALLET = "0x63ce342161250d705dc0b16df89036c8e5f9ba9a"
@@ -63,15 +60,17 @@ TARGET_PROFILE = "https://polymarket.com/@0x8dxd"
 DATA_API = "https://data-api.polymarket.com"
 GAMMA_API = "https://gamma-api.polymarket.com"
 
+PAPER_BUDGET = 100.0
+COPY_SCALE = 0.5
+
 
 # ============================================================================
-# COLOR SCHEME
+# COLORS
 # ============================================================================
 
 class Colors:
     RESET = "\033[0m"
     BOLD = "\033[1m"
-    DIM = "\033[2m"
     CYAN = "\033[96m"
     MAGENTA = "\033[95m"
     GREEN = "\033[92m"
@@ -84,220 +83,314 @@ class Colors:
 
 
 # ============================================================================
-# COPY TRADING DATA FETCHER
+# HELPER FUNCTIONS
+# ============================================================================
+
+def format_time_remaining(end_date_str: str) -> str:
+    """
+    Format time remaining until market ends.
+    Returns: "2h 15m" or "45m" or "5m 30s" or "ENDED"
+    """
+    if not end_date_str:
+        return "Unknown"
+
+    try:
+        # Parse end date (ISO format)
+        end_date = datetime.fromisoformat(end_date_str.replace('Z', '+00:00'))
+        now = datetime.now(timezone.utc)
+
+        if end_date <= now:
+            return f"{Colors.RED}ENDED{Colors.RESET}"
+
+        diff = end_date - now
+        total_seconds = int(diff.total_seconds())
+
+        days = total_seconds // 86400
+        hours = (total_seconds % 86400) // 3600
+        minutes = (total_seconds % 3600) // 60
+        seconds = total_seconds % 60
+
+        # Format based on time left
+        if days > 0:
+            return f"{Colors.YELLOW}{days}d {hours}h{Colors.RESET}"
+        elif hours > 0:
+            return f"{Colors.YELLOW}{hours}h {minutes}m{Colors.RESET}"
+        elif minutes > 0:
+            return f"{Colors.ORANGE}{minutes}m {seconds}s{Colors.RESET}"
+        else:
+            return f"{Colors.RED}{seconds}s{Colors.RESET}"
+
+    except Exception:
+        return "Unknown"
+
+
+def get_market_url(slug: str) -> str:
+    """Generate Polymarket URL from slug."""
+    if not slug:
+        return ""
+    return f"https://polymarket.com/event/{slug}"
+
+
+# ============================================================================
+# TRADE TRACKING WITH URL AND TIMER
 # ============================================================================
 
 @dataclass
-class TargetPosition:
-    """Position held by target wallet"""
-    condition_id: str
+class Trade:
+    """Trade with URL and end date tracking."""
+    trade_id: str
     market_title: str
     outcome: str
-    size: float
-    avg_price: float
-    current_price: float
-    pnl: float
-    token_id: str
     slug: str
-    market_url: str
-    last_updated: float
+
+    entry_price: float
+    entry_shares: float
+    entry_amount: float
+
+    exit_price: float = 0.0
+    exit_amount: float = 0.0
+    realized_pnl: float = 0.0
+
+    is_open: bool = True
+    open_time: float = 0.0
+    close_time: Optional[float] = None
+    end_date: str = ""  # ISO format end date
 
     @property
-    def position_value(self) -> float:
-        return self.size * self.current_price
+    def market_url(self) -> str:
+        return get_market_url(self.slug)
+
+    @property
+    def time_remaining(self) -> str:
+        return format_time_remaining(self.end_date)
+
+    def calculate_pnl(self) -> float:
+        if self.is_open:
+            return (self.exit_price - self.entry_price) * self.entry_shares
+        else:
+            return self.realized_pnl
 
 
-@dataclass
-class TargetTrade:
-    """Recent trade by target wallet"""
-    timestamp: str
-    market_title: str
-    side: str
-    outcome: str
-    size: float
-    price: float
-    value: float
-    condition_id: str
+class BudgetCopyTrader:
+    """Copy trader with URL and timer support."""
 
-
-class CopyTradingFetcher:
-    """
-    Fetches ALL positions and trades from target wallet using Polymarket Data API.
-    Tracks positions across ALL markets, not just current BTC market.
-    """
-
-    def __init__(self, wallet_address: str):
+    def __init__(self, wallet_address: str, budget: float = PAPER_BUDGET, copy_scale: float = COPY_SCALE):
         self.wallet = wallet_address
+        self.budget = budget
+        self.copy_scale = copy_scale
+
         self.session = requests.Session()
         self.session.headers.update({
             'Accept': 'application/json',
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
         })
-        self.all_positions: Dict[str, TargetPosition] = {}  # key: condition_id_outcome
-        self.position_history: List[Dict] = []
-        self.last_fetch = 0
-        self.total_value = 0.0
-        self.total_pnl = 0.0
 
-    def fetch_all_positions(self) -> Dict[str, TargetPosition]:
-        """Fetch ALL current positions of target wallet across ALL markets."""
+        # Budget tracking
+        self.invested = 0.0
+        self.available = budget
+        self.returned = 0.0
+        self.realized_profit = 0.0
+
+        # Positions and trades
+        self.target_positions: Dict[str, Dict] = {}
+        self.my_positions: Dict[str, Dict] = {}
+        self.all_trades: List[Trade] = []
+        self.open_trades: Dict[str, Trade] = {}
+
+        self.logger = logging.getLogger("budget_trader")
+
+    def fetch_target_positions(self) -> Dict[str, Dict]:
+        """Fetch positions with slug and end date."""
         try:
             url = f"{DATA_API}/positions"
             params = {
                 "user": self.wallet,
-                "sizeThreshold": 0.1,  # Include smaller positions
-                "limit": 500  # Max limit to get all
+                "sizeThreshold": 0.1,
+                "limit": 500,
             }
 
             resp = self.session.get(url, params=params, timeout=15)
             data = resp.json()
 
-            new_positions = {}
-            self.total_value = 0.0
-            self.total_pnl = 0.0
-
+            positions = {}
             for pos in data:
                 condition_id = pos.get('conditionId', '')
                 outcome = pos.get('outcome', 'Unknown')
                 key = f"{condition_id}_{outcome}"
 
-                # Get market info
-                market_info = self._get_market_info(condition_id)
+                avg_price = float(pos.get('avgPrice', 0) or 0)
+                shares = float(pos.get('size', 0) or 0)
+                slug = pos.get('slug', '')
+                end_date = pos.get('endDate', '')
 
-                position = TargetPosition(
-                    condition_id=condition_id,
-                    market_title=pos.get('title', 'Unknown Market'),
-                    outcome=outcome,
-                    size=float(pos.get('size', 0)),
-                    avg_price=float(pos.get('avgPrice', 0)),
-                    current_price=float(pos.get('price', 0)),
-                    pnl=float(pos.get('cashPnl', 0)),
-                    token_id=pos.get('assetId', ''),
-                    slug=market_info.get('slug', ''),
-                    market_url=market_info.get('url', ''),
-                    last_updated=time.time()
-                )
-
-                new_positions[key] = position
-                self.total_value += position.position_value
-                self.total_pnl += position.pnl
-
-            # Detect changes
-            self._detect_changes(new_positions)
-
-            self.all_positions = new_positions
-            self.last_fetch = time.time()
-
-            return self.all_positions
-
-        except Exception as e:
-            logging.getLogger("copy_trader").error(f"Fetch all positions error: {e}")
-            return self.all_positions
-
-    def _detect_changes(self, new_positions: Dict[str, TargetPosition]):
-        """Detect position changes for copy trading signals."""
-        # Find new positions
-        for key, pos in new_positions.items():
-            if key not in self.all_positions:
-                # New position opened
-                self.position_history.append({
-                    'time': time.time(),
-                    'action': 'OPEN',
-                    'position': pos,
-                    'message': f"NEW: {pos.market_title[:40]} | {pos.outcome} | {pos.size:.2f} shares"
-                })
-
-        # Find closed positions
-        for key, pos in self.all_positions.items():
-            if key not in new_positions:
-                # Position closed
-                self.position_history.append({
-                    'time': time.time(),
-                    'action': 'CLOSE',
-                    'position': pos,
-                    'message': f"CLOSED: {pos.market_title[:40]} | {pos.outcome} | PnL: ${pos.pnl:+.2f}"
-                })
-
-    def fetch_recent_trades(self, limit: int = 20) -> List[TargetTrade]:
-        """Fetch recent trades of target wallet."""
-        try:
-            url = f"{DATA_API}/trades"
-            params = {
-                "user": self.wallet,
-                "limit": limit,
-                "takerOnly": "false"
-            }
-
-            resp = self.session.get(url, params=params, timeout=10)
-            data = resp.json()
-
-            trades = []
-            for trade in data:
-                trades.append(TargetTrade(
-                    timestamp=trade.get('matchTime', ''),
-                    market_title=trade.get('title', 'Unknown'),
-                    side=trade.get('side', 'UNKNOWN'),
-                    outcome=trade.get('outcome', 'Unknown'),
-                    size=float(trade.get('size', 0)),
-                    price=float(trade.get('price', 0)),
-                    value=float(trade.get('size', 0)) * float(trade.get('price', 0)),
-                    condition_id=trade.get('conditionId', '')
-                ))
-
-            return trades
-
-        except Exception as e:
-            logging.getLogger("copy_trader").error(f"Fetch trades error: {e}")
-            return []
-
-    def _get_market_info(self, condition_id: str) -> Dict:
-        """Get market slug and URL."""
-        try:
-            url = f"{GAMMA_API}/markets"
-            params = {"condition_id": condition_id}
-            resp = self.session.get(url, params=params, timeout=5)
-            markets = resp.json()
-            if markets:
-                slug = markets[0].get('slug', '')
-                return {
+                positions[key] = {
+                    'condition_id': condition_id,
+                    'market_title': pos.get('title', 'Unknown Market'),
+                    'outcome': outcome,
+                    'avg_price': avg_price,
+                    'cur_price': float(pos.get('curPrice', 0) or 0),
+                    'shares': shares,
+                    'entry_amount': avg_price * shares,
+                    'current_value': float(pos.get('currentValue', 0) or 0),
                     'slug': slug,
-                    'url': f"https://polymarket.com/event/{slug}" if slug else ''
+                    'market_url': get_market_url(slug),
+                    'end_date': end_date,
                 }
-        except:
-            pass
-        return {'slug': '', 'url': ''}
 
-    def get_btc_5min_position(self) -> Optional[TargetPosition]:
-        """Get position in current BTC 5-min market if exists."""
-        for pos in self.all_positions.values():
-            if "btc" in pos.market_title.lower() and "5m" in pos.slug.lower():
-                return pos
-        return None
+            return positions
 
-    def get_all_market_urls(self) -> List[str]:
-        """Get list of all market URLs with positions."""
-        urls = []
-        for pos in self.all_positions.values():
-            if pos.market_url:
-                urls.append(pos.market_url)
-        return urls
+        except Exception as e:
+            self.logger.error(f"Fetch error: {e}")
+            return self.target_positions
+
+    def sync_positions(self):
+        """Sync with budget constraints."""
+        actions = []
+
+        new_target = self.fetch_target_positions()
+
+        # OPEN new positions
+        for key, target_pos in new_target.items():
+            if key not in self.my_positions and key not in self.target_positions:
+                needed = target_pos['entry_amount'] * self.copy_scale
+
+                if needed <= self.available:
+                    action = self._open_position(target_pos, needed)
+                    actions.append(action)
+                else:
+                    actions.append(f"SKIP: {target_pos['market_title'][:25]} | "
+                                   f"Need ${needed:.2f}, have ${self.available:.2f}")
+
+        # UPDATE existing
+        for key, target_pos in new_target.items():
+            if key in self.my_positions:
+                self.my_positions[key]['cur_price'] = target_pos['cur_price']
+                self.my_positions[key]['current_value'] = target_pos['current_value'] * self.copy_scale
+
+                if key in self.open_trades:
+                    self.open_trades[key].exit_price = target_pos['cur_price']
+
+        # CLOSE positions
+        for key in list(self.my_positions.keys()):
+            if key not in new_target and key in self.target_positions:
+                action = self._close_position(key)
+                actions.append(action)
+
+        self.target_positions = new_target
+        return actions
+
+    def _open_position(self, target_pos: Dict, amount: float) -> str:
+        """Open position with URL and timer."""
+        our_shares = target_pos['shares'] * self.copy_scale
+
+        # Deduct from budget
+        self.available -= amount
+        self.invested += amount
+
+        position = {
+            'condition_id': target_pos['condition_id'],
+            'market_title': target_pos['market_title'],
+            'outcome': target_pos['outcome'],
+            'avg_price': target_pos['avg_price'],
+            'cur_price': target_pos['cur_price'],
+            'shares': our_shares,
+            'entry_amount': amount,
+            'current_value': target_pos['current_value'] * self.copy_scale,
+            'slug': target_pos['slug'],
+            'market_url': target_pos['market_url'],
+            'end_date': target_pos['end_date'],
+        }
+
+        key = f"{target_pos['condition_id']}_{target_pos['outcome']}"
+        self.my_positions[key] = position
+
+        # Track trade with URL and end date
+        trade = Trade(
+            trade_id=key,
+            market_title=target_pos['market_title'],
+            outcome=target_pos['outcome'],
+            slug=target_pos['slug'],
+            entry_price=target_pos['avg_price'],
+            entry_shares=our_shares,
+            entry_amount=amount,
+            exit_price=target_pos['cur_price'],
+            is_open=True,
+            open_time=time.time(),
+            end_date=target_pos['end_date']
+        )
+        self.open_trades[key] = trade
+        self.all_trades.append(trade)
+
+        # Format time remaining for display
+        time_left = format_time_remaining(target_pos['end_date'])
+
+        self.logger.info(f"OPENED: ${amount:.2f} | {position['market_title'][:40]} | "
+                         f"Time left: {time_left}")
+
+        return (f"OPEN: ${amount:.2f} | {position['market_title'][:25]} | "
+                f"Time: {time_left}")
+
+    def _close_position(self, key: str) -> str:
+        """Close position."""
+        if key not in self.my_positions:
+            return ""
+
+        pos = self.my_positions[key]
+
+        # Calculate return
+        exit_value = pos['cur_price'] * pos['shares']
+        profit = exit_value - pos['entry_amount']
+
+        # Return to budget
+        self.invested -= pos['entry_amount']
+        self.available += exit_value
+        self.returned += exit_value
+        self.realized_profit += profit
+
+        # Update trade
+        if key in self.open_trades:
+            trade = self.open_trades[key]
+            trade.is_open = False
+            trade.close_time = time.time()
+            trade.exit_amount = exit_value
+            trade.realized_pnl = profit
+
+        del self.open_trades[key]
+        del self.my_positions[key]
+
+        return (f"CLOSE: ${pos['entry_amount']:.2f} → ${exit_value:.2f} | "
+                f"Profit: ${profit:+.2f}")
+
+    def get_budget_summary(self) -> Dict:
+        """Get budget summary."""
+        unrealized = sum(
+            (p['cur_price'] - p['avg_price']) * p['shares']
+            for p in self.my_positions.values()
+        )
+
+        return {
+            'budget': self.budget,
+            'invested': self.invested,
+            'available': self.available,
+            'returned': self.returned,
+            'realized_profit': self.realized_profit,
+            'unrealized_pnl': unrealized,
+            'total_value': self.available + sum(p['current_value'] for p in self.my_positions.values()),
+            'positions': len(self.my_positions),
+        }
 
 
 # ============================================================================
-# FULL COPY TRADING DASHBOARD
+# DASHBOARD WITH URLS AND TIMERS
 # ============================================================================
 
-class FullCopyDashboard:
-    """
-    Dashboard showing ALL positions from target wallet across ALL markets.
-    """
+class BudgetDashboard:
+    """Dashboard with bet URLs and countdown timers."""
 
     def __init__(self):
-        self.width = 95
+        self.width = 110  # Wider for URLs
         self.start_time = time.time()
-        self.my_trades = []
-        self.scroll_offset = 0
-        self.selected_tab = 0  # 0: All, 1: BTC Only, 2: My Trades
+        self.last_actions = []
 
         self._clear()
         sys.stdout.write("\033[?25l")
@@ -315,143 +408,157 @@ class FullCopyDashboard:
         secs = int(seconds % 60)
         return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
-    def _truncate(self, text: str, length: int) -> str:
-        return text[:length - 3] + "..." if len(text) > length else text
+    def _bar(self, current: float, max_val: float, width: int = 30) -> str:
+        if max_val == 0:
+            return "░" * width
+        filled = int((current / max_val) * width)
+        return "█" * filled + "░" * (width - filled)
 
-    def update(self, state: SharedState, fetcher: CopyTradingFetcher, copy_trader: 'FullCopyTrader'):
-        """Render full dashboard with all positions."""
+    def _truncate_url(self, url: str, max_len: int = 40) -> str:
+        """Truncate URL for display."""
+        if len(url) <= max_len:
+            return url
+        return url[:max_len - 3] + "..."
+
+    def update(self, trader: BudgetCopyTrader):
+        """Render dashboard with URLs and timers."""
         now = time.time()
         uptime = now - self.start_time
 
-        positions = list(fetcher.all_positions.values())
-        history = fetcher.position_history[-10:]  # Last 10 changes
-
-        # Get BTC 5-min specific
-        btc_position = fetcher.get_btc_5min_position()
-        btc_price = getattr(state, 'binance_btc_price', 0.0)
+        summary = trader.get_budget_summary()
+        my_positions = list(trader.my_positions.values())
+        closed_trades = [t for t in trader.all_trades if not t.is_open][-5:]
 
         lines = []
 
         # Header
         lines.append(f"{Colors.CYAN}{'═' * self.width}{Colors.RESET}")
         lines.append(
-            f"{Colors.BOLD}{Colors.WHITE}  POLYMARKET COPY TRADER - ALL MARKETS{Colors.RESET}  {Colors.GREEN}● LIVE{Colors.RESET}")
+            f"{Colors.BOLD}{Colors.WHITE}  POLYMARKET COPY TRADER - $100 BUDGET + URLs & TIMERS{Colors.RESET}  {Colors.GREEN}● LIVE{Colors.RESET}")
         lines.append(f"{Colors.CYAN}{'═' * self.width}{Colors.RESET}")
+        lines.append("")
+
+        # BUDGET BREAKDOWN
+        lines.append(f"{Colors.GREEN}{Colors.BOLD}  ▼ YOUR $100 BUDGET{Colors.RESET}")
+        lines.append(f"{Colors.GRAY}  {'─' * 80}{Colors.RESET}")
+
+        invested_pct = (summary['invested'] / summary['budget']) * 100
+        bar = self._bar(summary['invested'], summary['budget'])
+
+        lines.append(f"  Total Budget:      {Colors.BOLD}{Colors.WHITE}${summary['budget']:.2f}{Colors.RESET}")
+        lines.append(f"")
+        lines.append(
+            f"  {Colors.YELLOW}INVESTED:{Colors.RESET}          {Colors.YELLOW}${summary['invested']:.2f}{Colors.RESET} ({invested_pct:.1f}%)  {bar}")
+        lines.append(f"  {Colors.GREEN}AVAILABLE:         ${summary['available']:.2f}{Colors.RESET}")
+        lines.append(f"  {Colors.BLUE}CASH RETURNED:     ${summary['returned']:.2f}{Colors.RESET}")
+        lines.append(f"")
+
+        realized_color = Colors.GREEN if summary['realized_profit'] >= 0 else Colors.RED
+        unreal_color = Colors.GREEN if summary['unrealized_pnl'] >= 0 else Colors.RED
+
+        lines.append(f"  Realized Profit:   {realized_color}${summary['realized_profit']:+.2f}{Colors.RESET}")
+        lines.append(f"  Unrealized P&L:    {unreal_color}${summary['unrealized_pnl']:+.2f}{Colors.RESET}")
+        lines.append(f"  Portfolio Value:   {Colors.CYAN}${summary['total_value']:.2f}{Colors.RESET}")
+        lines.append("")
 
         # Target Info
-        lines.append(f"{Colors.MAGENTA}  TARGET WALLET:{Colors.RESET} {Colors.YELLOW}{TARGET_WALLET}{Colors.RESET}")
-        lines.append(f"{Colors.MAGENTA}  PROFILE:{Colors.RESET}       {Colors.BLUE}{TARGET_PROFILE}{Colors.RESET}")
-        lines.append(
-            f"{Colors.MAGENTA}  MODE:{Colors.RESET}          {Colors.GREEN}PAPER TRADING (Copying ALL positions){Colors.RESET}")
+        lines.append(f"{Colors.MAGENTA}  ▼ TARGET WALLET{Colors.RESET}")
+        lines.append(f"{Colors.GRAY}  {'─' * 80}{Colors.RESET}")
+        lines.append(f"  Wallet:  {Colors.YELLOW}{TARGET_WALLET[:25]}...{Colors.RESET}")
+        lines.append(f"  Profile: {Colors.BLUE}{TARGET_PROFILE}{Colors.RESET}")
+        lines.append(f"  Copy Scale: {Colors.YELLOW}50%{Colors.RESET}")
         lines.append("")
 
-        # Portfolio Summary
-        lines.append(f"{Colors.GREEN}  ▼ PORTFOLIO SUMMARY{Colors.RESET}")
-        lines.append(f"{Colors.GRAY}  {'─' * 70}{Colors.RESET}")
-        lines.append(f"  Total Positions: {Colors.WHITE}{len(positions)}{Colors.RESET}")
-        lines.append(f"  Total Value:     {Colors.CYAN}${fetcher.total_value:,.2f}{Colors.RESET}")
-        lines.append(
-            f"  Total P&L:       {Colors.GREEN if fetcher.total_pnl >= 0 else Colors.RED}${fetcher.total_pnl:+.2f}{Colors.RESET}")
-        lines.append("")
+        # OPEN POSITIONS WITH URLS AND TIMERS
+        lines.append(f"{Colors.YELLOW}  ▼ YOUR POSITIONS (With Bet URLs & Time Remaining){Colors.RESET}")
+        lines.append(f"{Colors.GRAY}  {'─' * 105}{Colors.RESET}")
 
-        # BTC 5-Min Market (Current Focus)
-        lines.append(f"{Colors.YELLOW}  ▼ CURRENT BTC 5-MIN MARKET{Colors.RESET}")
-        lines.append(f"{Colors.GRAY}  {'─' * 70}{Colors.RESET}")
-
-        if btc_position:
-            url = btc_position.market_url
-            lines.append(f"  {Colors.CYAN}URL:{Colors.RESET} {url}")
-            lines.append(f"  Market:  {Colors.WHITE}{self._truncate(btc_position.market_title, 50)}{Colors.RESET}")
-            out_color = Colors.GREEN if btc_position.outcome == "Yes" else Colors.RED
-            lines.append(
-                f"  Target:  {out_color}{btc_position.outcome}{Colors.RESET} | {btc_position.size:.2f} shares @ {btc_position.current_price:.4f}")
-            lines.append(
-                f"  BTC Price: ${btc_price:,.2f} | Position PnL: {Colors.GREEN if btc_position.pnl >= 0 else Colors.RED}${btc_position.pnl:+.2f}{Colors.RESET}")
-        else:
-            lines.append(f"  {Colors.GRAY}No BTC 5-min position found{Colors.RESET}")
-            # Show current market URL anyway
-            if hasattr(state, 'market_end_ts') and state.market_end_ts:
-                timestamp = int(state.market_end_ts)
-                url = f"https://polymarket.com/event/btc-updown-5m-{timestamp}"
-                lines.append(f"  {Colors.CYAN}Current Market:{Colors.RESET} {url}")
-
-        lines.append("")
-
-        # ALL Positions Table
-        lines.append(f"{Colors.YELLOW}  ▼ ALL TARGET POSITIONS (Across All Markets){Colors.RESET}")
-        lines.append(f"{Colors.GRAY}  {'─' * 90}{Colors.RESET}")
-
-        if positions:
+        if my_positions:
             # Header
             lines.append(
-                f"  {Colors.BOLD}{'Market':<30} {'Outcome':<8} {'Size':>10} {'Price':>8} {'Value':>12} {'PnL':>12} {'URL':>20}{Colors.RESET}")
-            lines.append(f"  {Colors.GRAY}{'─' * 90}{Colors.RESET}")
+                f"  {Colors.BOLD}{'Market':<25} {'Inv $':>8} {'P&L $':>9} {'Time Left':>12} {'Bet URL':<45}{Colors.RESET}")
+            lines.append(f"  {Colors.GRAY}{'─' * 105}{Colors.RESET}")
 
-            # Sort by value (largest first)
-            sorted_positions = sorted(positions, key=lambda p: p.position_value, reverse=True)
+            for pos in sorted(my_positions, key=lambda p: p['entry_amount'], reverse=True)[:6]:
+                pnl = (pos['cur_price'] - pos['avg_price']) * pos['shares']
+                pnl_color = Colors.GREEN if pnl >= 0 else Colors.RED
 
-            for pos in sorted_positions[:8]:  # Show top 8
-                pnl_color = Colors.GREEN if pos.pnl >= 0 else Colors.RED
-                out_color = Colors.GREEN if pos.outcome == "Yes" else Colors.RED
-                url_short = pos.slug[:17] + "..." if len(pos.slug) > 20 else pos.slug
+                market_name = pos['market_title'][:24] if len(pos['market_title']) <= 25 else pos['market_title'][
+                                                                                                  :22] + ".."
+                time_left = format_time_remaining(pos['end_date'])
+                url = self._truncate_url(pos['market_url'], 45)
 
-                lines.append(f"  {self._truncate(pos.market_title, 29):<30} {out_color}{pos.outcome:<8}{Colors.RESET} "
-                             f"{pos.size:>10.2f} {pos.current_price:>8.4f} "
-                             f"{Colors.CYAN}${pos.position_value:>11.2f}{Colors.RESET} "
-                             f"{pnl_color}${pos.pnl:>+11.2f}{Colors.RESET} "
-                             f"{Colors.BLUE}{url_short:>20}{Colors.RESET}")
+                lines.append(f"  {market_name:<25} "
+                             f"{Colors.YELLOW}${pos['entry_amount']:>7.2f}{Colors.RESET} "
+                             f"{pnl_color}${pnl:>+8.2f}{Colors.RESET} "
+                             f"{time_left:>12} "
+                             f"{Colors.BLUE}{url}{Colors.RESET}")
         else:
-            lines.append(f"  {Colors.GRAY}Loading positions...{Colors.RESET}")
+            lines.append(f"  {Colors.GRAY}No positions - $100 available{Colors.RESET}")
 
         lines.append("")
 
-        # Recent Activity
-        lines.append(f"{Colors.ORANGE}  ▼ RECENT ACTIVITY (Position Changes){Colors.RESET}")
-        lines.append(f"{Colors.GRAY}  {'─' * 70}{Colors.RESET}")
+        # CLOSED TRADES
+        lines.append(f"{Colors.GREEN}  ▼ CLOSED TRADES (Completed Bets){Colors.RESET}")
+        lines.append(f"{Colors.GRAY}  {'─' * 105}{Colors.RESET}")
 
-        if history:
-            for item in history[-5:]:
-                action_color = Colors.GREEN if item['action'] == 'OPEN' else Colors.RED
-                time_str = datetime.fromtimestamp(item['time']).strftime('%H:%M:%S')
-                lines.append(f"  [{time_str}] {action_color}{item['action']}{Colors.RESET}: {item['message']}")
+        if closed_trades:
+            lines.append(
+                f"  {Colors.BOLD}{'Market':<30} {'Inv $':>8} {'Ret $':>8} {'Profit':>9} {'Bet URL':<50}{Colors.RESET}")
+            lines.append(f"  {Colors.GRAY}{'─' * 105}{Colors.RESET}")
+
+            for trade in reversed(closed_trades):
+                pnl_color = Colors.GREEN if trade.realized_pnl >= 0 else Colors.RED
+                # FIXED LINE HERE - removed extra quote
+                market_name = trade.market_title[:29] if len(trade.market_title) <= 30 else trade.market_title[
+                                                                                                :27] + ".."
+                url = self._truncate_url(trade.market_url, 50)
+
+                lines.append(f"  {market_name:<30} "
+                             f"{Colors.YELLOW}${trade.entry_amount:>7.2f}{Colors.RESET} "
+                             f"{Colors.CYAN}${trade.exit_amount:>7.2f}{Colors.RESET} "
+                             f"{pnl_color}${trade.realized_pnl:>+8.2f}{Colors.RESET} "
+                             f"{Colors.BLUE}{url}{Colors.RESET}")
         else:
-            lines.append(f"  {Colors.GRAY}Waiting for changes...{Colors.RESET}")
+            lines.append(f"  {Colors.GRAY}No closed trades yet{Colors.RESET}")
 
-        lines.append("")
+                lines.append("")
+                # Recent Activity
+                lines.append(f"{Colors.ORANGE}  ▼ RECENT ACTIVITY{Colors.RESET}")
+                lines.append(f"{Colors.GRAY}  {'─' * 80}{Colors.RESET}")
 
-        # My Copy Trades
-        total_my_pnl = sum(t.get('pnl', 0) for t in self.my_trades)
-        lines.append(f"{Colors.CYAN}  ▼ MY COPY TRADES{Colors.RESET}")
-        lines.append(f"{Colors.GRAY}  {'─' * 70}{Colors.RESET}")
-        lines.append(
-            f"  Total: {len(self.my_trades)} trades | P&L: {Colors.GREEN if total_my_pnl >= 0 else Colors.RED}${total_my_pnl:+.2f}{Colors.RESET}")
+                if self.last_actions:
+                    for
+                action in self.last_actions[-5:]:
+                if "OPEN" in action:
+                    color = Colors.GREEN
+                elif "CLOSE" in action:
+                    color = Colors.RED
+                elif "SKIP" in action:
+                    color = Colors.YELLOW
+                else:
+                    color = Colors.WHITE
+                lines.append(f"  {color}{action}{Colors.RESET}")
+                else:
+                lines.append(f"  {Colors.GRAY}No activity{Colors.RESET}")
 
-        if self.my_trades:
-            for t in self.my_trades[-3:]:
-                dir_color = Colors.GREEN if t['direction'] == 'UP' else Colors.RED
-                pnl_color = Colors.GREEN if t.get('pnl', 0) >= 0 else Colors.RED
-                market = self._truncate(t.get('market', 'Unknown'), 25)
-                lines.append(f"  {dir_color}{t['direction']:<6}{Colors.RESET} {market:<25} @ {t.get('price', 0):.4f} "
-                             f"PnL: {pnl_color}${t.get('pnl', 0):+.2f}{Colors.RESET} [{t.get('reason', '')}]")
-        else:
-            lines.append(f"  {Colors.GRAY}No copy trades executed yet...{Colors.RESET}")
+                lines.append("")
+                lines.append(f"{Colors.CYAN}{'═' * self.width}{Colors.RESET}")
+                lines.append(
+                    f"  {Colors.GRAY}Uptime: {self._format_time(uptime)} | Updates every 10s | Ctrl+C to stop{Colors.RESET}")
 
-        lines.append("")
-        lines.append(f"{Colors.CYAN}{'═' * self.width}{Colors.RESET}")
-        lines.append(
-            f"  {Colors.GRAY}Uptime: {self._format_time(uptime)} | Positions update every 10s | Ctrl+C to stop{Colors.RESET}")
+                # Render
+                self._clear()
+                for i, line in enumerate(lines):
+                    self._print(i + 1, line, 0)
 
-        # Render
-        self._clear()
-        for i, line in enumerate(lines):
-            self._print(i + 1, line, 0)
+                sys.stdout.flush()
 
-        sys.stdout.flush()
-
-    def add_trade(self, trade: Dict):
-        self.my_trades.append(trade)
-        if len(self.my_trades) > 50:
-            self.my_trades = self.my_trades[-50:]
+    def add_action(self, action: str):
+        timestamp = datetime.now().strftime('%H:%M:%S')
+        self.last_actions.append(f"[{timestamp}] {action}")
+        if len(self.last_actions) > 10:
+            self.last_actions = self.last_actions[-10:]
 
     def close(self):
         sys.stdout.write("\033[?25h")
@@ -459,191 +566,10 @@ class FullCopyDashboard:
 
 
 # ============================================================================
-# FULL COPY TRADER - ALL MARKETS
+# LOGGING
 # ============================================================================
 
-class FullCopyTrader:
-    """
-    Copies ALL positions from target wallet across ALL markets.
-    Not limited to BTC 5-min markets.
-    """
-
-    def __init__(
-            self,
-            state: SharedState,
-            executor: PolyExecutor,
-            risk_mgr: RiskManager,
-            metrics: MetricsTracker,
-            dashboard: FullCopyDashboard,
-            paper_trade: bool = True,
-            copy_scale: float = 0.1,  # Copy 10% of target size
-    ):
-        self.state = state
-        self.executor = executor
-        self.risk_mgr = risk_mgr
-        self.metrics = metrics
-        self.dashboard = dashboard
-        self.paper_trade = paper_trade
-        self.copy_scale = copy_scale
-
-        self.fetcher = CopyTradingFetcher(TARGET_WALLET)
-        self.status = "INITIALIZING"
-        self.running = False
-
-        # Track our copied positions
-        self.my_positions: Dict[str, Dict] = {}  # key: condition_id_outcome
-
-        self.logger = logging.getLogger("full_copy_trader")
-        self.logger.info(f"FullCopyTrader initialized for {TARGET_WALLET[:20]}...")
-        self.logger.info(f"Copy scale: {copy_scale * 100}% of target position size")
-
-    async def run(self):
-        """Main loop - copy ALL positions."""
-        self.logger.info("FullCopyTrader starting...")
-        self.running = True
-        self.status = "MONITORING"
-
-        while self.running:
-            try:
-                # Fetch all target positions
-                target_positions = self.fetcher.fetch_all_positions()
-
-                # Copy each position
-                for key, target_pos in target_positions.items():
-                    if key not in self.my_positions:
-                        # New position - OPEN it
-                        await self._open_position(target_pos)
-                    else:
-                        # Check for size changes
-                        my_pos = self.my_positions[key]
-                        size_diff = abs(target_pos.size - my_pos['target_size'])
-                        if size_diff / max(target_pos.size, 1) > 0.2:  # 20% change
-                            await self._adjust_position(target_pos, my_pos)
-
-                # Check for closed positions
-                for key in list(self.my_positions.keys()):
-                    if key not in target_positions:
-                        await self._close_position(key)
-
-                self.status = f"TRACKING {len(target_positions)} positions"
-
-                await asyncio.sleep(10)  # Update every 10 seconds
-
-            except Exception as e:
-                self.logger.error(f"FullCopyTrader error: {e}")
-                self.status = "ERROR"
-                await asyncio.sleep(15)
-
-    async def _open_position(self, target_pos: TargetPosition):
-        """Open a new copied position."""
-        self.status = "OPENING POSITION"
-
-        copy_size = target_pos.size * self.copy_scale
-
-        direction = 'UP' if target_pos.outcome == "Yes" else 'DOWN'
-
-        self.logger.info(f"COPYING: {target_pos.market_title[:40]} | "
-                         f"{direction} | {copy_size:.2f} shares @ {target_pos.current_price:.4f}")
-
-        trade_data = {
-            'direction': direction,
-            'market': target_pos.market_title,
-            'price': target_pos.current_price,
-            'size': copy_size,
-            'target_size': target_pos.size,  # Track original
-            'pnl': 0,
-            'open': True,
-            'reason': f"copy_{TARGET_WALLET[:6]}",
-            'condition_id': target_pos.condition_id,
-            'outcome': target_pos.outcome,
-            'token_id': target_pos.token_id,
-            'market_url': target_pos.market_url
-        }
-
-        key = f"{target_pos.condition_id}_{target_pos.outcome}"
-        self.my_positions[key] = trade_data
-        self.dashboard.add_trade(trade_data)
-
-        if not self.paper_trade:
-            try:
-                # Determine token ID based on outcome
-                token_id = target_pos.token_id
-
-                await self.executor.place_order(
-                    token_id=token_id,
-                    price=target_pos.current_price,
-                    size=copy_size,
-                    side='BUY',
-                    order_type='FOK'
-                )
-                self.logger.info(f"Order executed: {token_id[:20]}...")
-            except Exception as e:
-                self.logger.error(f"Order failed: {e}")
-
-        self.status = "MONITORING"
-
-    async def _adjust_position(self, target_pos: TargetPosition, my_pos: Dict):
-        """Adjust position size to match target."""
-        new_size = target_pos.size * self.copy_scale
-        old_size = my_pos['size']
-
-        self.logger.info(f"ADJUSTING: {target_pos.market_title[:40]} | "
-                         f"{old_size:.2f} -> {new_size:.2f}")
-
-        my_pos['target_size'] = target_pos.size
-        my_pos['size'] = new_size
-        my_pos['price'] = target_pos.current_price
-
-    async def _close_position(self, key: str):
-        """Close a position when target closes."""
-        if key not in self.my_positions:
-            return
-
-        my_pos = self.my_positions[key]
-
-        # Calculate PnL
-        current_price = my_pos['price']  # Simplified
-        if my_pos['direction'] == 'UP':
-            pnl = (current_price - my_pos['price']) * my_pos['size']
-        else:
-            pnl = (my_pos['price'] - current_price) * my_pos['size']
-
-        self.logger.info(f"CLOSING: {my_pos['market'][:40]} | PnL: ${pnl:.2f}")
-
-        my_pos['pnl'] = pnl
-        my_pos['open'] = False
-        my_pos['reason'] = 'target_closed'
-
-        self.dashboard.add_trade(my_pos)
-        self.risk_mgr.update_after_trade(pnl)
-
-        if not self.paper_trade:
-            try:
-                await self.executor.place_order(
-                    token_id=my_pos['token_id'],
-                    price=current_price,
-                    size=my_pos['size'],
-                    side='SELL',
-                    order_type='IOC'
-                )
-            except Exception as e:
-                self.logger.error(f"Close order failed: {e}")
-
-        del self.my_positions[key]
-
-    def stop(self):
-        self.running = False
-
-    def get_all_market_urls(self) -> List[str]:
-        """Get all market URLs being tracked."""
-        return self.fetcher.get_all_market_urls()
-
-
-# ============================================================================
-# LOGGING SETUP
-# ============================================================================
-
-def setup_file_logging(level: str, log_file: str):
+def setup_logging(level: str, log_file: str):
     os.makedirs(os.path.dirname(log_file) if os.path.dirname(log_file) else "logs", exist_ok=True)
 
     file_handler = logging.FileHandler(log_file, mode='a', encoding='utf-8')
@@ -664,98 +590,66 @@ def setup_file_logging(level: str, log_file: str):
 # MAIN
 # ============================================================================
 
-def select_mode():
-    print(f"\n{Colors.CYAN}{'═' * 60}{Colors.RESET}")
-    print(f"{Colors.BOLD}{Colors.WHITE}  POLYMARKET FULL COPY TRADER{Colors.RESET}")
-    print(f"{Colors.CYAN}{'═' * 60}{Colors.RESET}")
-    print(f"\n  {Colors.GREEN}1.{Colors.RESET} FULL COPY   - Copy ALL positions from wallet")
-    print(f"  {Colors.YELLOW}2.{Colors.RESET} BTC FOCUS   - Copy only BTC 5-min markets")
-    print(f"  {Colors.BLUE}3.{Colors.RESET} DASHBOARD   - View only (no copying)")
-    print(f"{Colors.CYAN}{'═' * 60}{Colors.RESET}")
-
-    while True:
-        choice = input(f"\n  Select mode {Colors.BOLD}(1/2/3){Colors.RESET}: ").strip()
-        if choice in ["1", "2", "3"]:
-            break
-        print(f"  {Colors.RED}Invalid choice{Colors.RESET}")
-
-    modes = {"1": "full", "2": "btc", "3": "view"}
-    return modes[choice]
-
-
 async def main():
-    selected_mode = select_mode()
-
-    # Setup logging
-    setup_file_logging(LOG_LEVEL, LOG_FILE)
+    setup_logging(LOG_LEVEL, LOG_FILE)
     logger = logging.getLogger("main")
 
-    # Create dashboard
-    dashboard = FullCopyDashboard()
+    print(f"\n{Colors.CYAN}{'═' * 70}{Colors.RESET}")
+    print(f"{Colors.BOLD}{Colors.WHITE}  POLYMARKET COPY TRADER - URLs & TIMERS{Colors.RESET}")
+    print(f"{Colors.CYAN}{'═' * 70}{Colors.RESET}")
+    print(f"\n  {Colors.GREEN}PAPER TRADING MODE{Colors.RESET} | Budget: {Colors.BOLD}$100.00{Colors.RESET}")
+    print(f"  Copy Scale: {Colors.YELLOW}50%{Colors.RESET}")
+    print(f"")
+    print(f"  {Colors.GRAY}Features:{Colors.RESET}")
+    print(f"  • Shows Polymarket bet URL for each position")
+    print(f"  • Countdown timer showing time until market ends")
+    print(f"  • Tracks your $100 budget in real-time")
+    print(f"\n{Colors.CYAN}{'═' * 70}{Colors.RESET}\n")
 
-    logger.info(f"Starting in {selected_mode} mode")
-    print(f"\n{Colors.GREEN}Starting copy trader...{Colors.RESET}")
-    print(f"{Colors.GRAY}Target: {TARGET_WALLET}{Colors.RESET}")
-    print(f"{Colors.GRAY}Profile: {TARGET_PROFILE}{Colors.RESET}\n")
+    dashboard = BudgetDashboard()
+    trader = BudgetCopyTrader(TARGET_WALLET, budget=PAPER_BUDGET, copy_scale=COPY_SCALE)
 
-    # Initialize components
-    state = SharedState()
-    finder = MarketFinder(state)
-    binance = BinanceListener(state)
-    rtds = RTDSListener(state, symbol="btc")
-    chainlink = ChainlinkListener(state)
-    poly_book = PolyBookListener(state)
-    executor = PolyExecutor()
-    metrics = MetricsTracker(log_dir="logs", state=state)
+    print(f"{Colors.YELLOW}Fetching target positions...{Colors.RESET}")
+    trader.fetch_target_positions()
+    print(f"  Target has {Colors.WHITE}{len(trader.target_positions)}{Colors.RESET} positions")
 
-    balance = executor.get_balance() if not PAPER_TRADE else 1000.0
-    state.current_balance = balance
-    risk_mgr = RiskManager(starting_balance=balance)
+    print(f"\n{Colors.YELLOW}Copying positions with URLs and timers...{Colors.RESET}")
+    actions = trader.sync_positions()
+    for action in actions:
+        dashboard.add_action(action)
+        print(f"  {action}")
 
-    # Initialize copy trader
-    copy_trader = FullCopyTrader(
-        state, executor, risk_mgr, metrics, dashboard,
-        paper_trade=PAPER_TRADE,
-        copy_scale=0.1  # 10% of target size
-    )
-
-    # Fetch initial market for BTC price context
-    initial = await finder.fetch_once()
-    if initial:
-        state.active_token_id = initial["_token_up"]
-        state.active_token_down = initial["_token_down"]
-        state.active_condition_id = initial.get("conditionId", "")
-        state.market_end_ts = initial["_end_ts"]
-        state.seconds_remaining = max(0, initial["_end_ts"] - int(time.time()))
-
-    # Tasks
-    tasks = [
-        asyncio.create_task(finder.start()),
-        asyncio.create_task(binance.start()),
-        asyncio.create_task(rtds.start()),
-        asyncio.create_task(chainlink.start()),
-    ]
-
-    # Dashboard updater
-    async def dashboard_updater():
-        while True:
-            dashboard.update(state, copy_trader.fetcher, copy_trader)
-            await asyncio.sleep(0.5)
-
-    tasks.append(asyncio.create_task(dashboard_updater()))
-
-    # Copy trader task
-    if selected_mode in ["full", "btc"]:
-        tasks.append(asyncio.create_task(copy_trader.run()))
+    print(f"\n{Colors.GREEN}Budget: ${trader.available:.2f} available / $100.00 total{Colors.RESET}")
+    print(f"\n{Colors.GREEN}Starting monitoring...{Colors.RESET}\n")
 
     try:
-        await asyncio.gather(*tasks)
+        while True:
+            actions = trader.sync_positions()
+            for action in actions:
+                dashboard.add_action(action)
+
+            dashboard.update(trader)
+
+            await asyncio.sleep(10)
+
     except KeyboardInterrupt:
-        pass
+        print(f"\n{Colors.YELLOW}Shutting down...{Colors.RESET}")
     finally:
         dashboard.close()
-        copy_trader.stop()
-        logger.info("Shutdown complete")
+
+        summary = trader.get_budget_summary()
+        print(f"\n{Colors.CYAN}{'═' * 70}{Colors.RESET}")
+        print(f"{Colors.BOLD}FINAL BUDGET REPORT{Colors.RESET}")
+        print(f"{Colors.CYAN}{'═' * 70}{Colors.RESET}")
+        print(f"Started with:      ${summary['budget']:.2f}")
+        print(f"Currently Invested: ${summary['invested']:.2f}")
+        print(f"Available Cash:    ${summary['available']:.2f}")
+        print(
+            f"Realized Profit:   {Colors.GREEN if summary['realized_profit'] >= 0 else Colors.RED}${summary['realized_profit']:+.2f}{Colors.RESET}")
+        print(
+            f"Unrealized P&L:    {Colors.GREEN if summary['unrealized_pnl'] >= 0 else Colors.RED}${summary['unrealized_pnl']:+.2f}{Colors.RESET}")
+        print(f"Portfolio Value:   {Colors.CYAN}${summary['total_value']:.2f}{Colors.RESET}")
+        print(f"{Colors.CYAN}{'═' * 70}{Colors.RESET}")
 
 
 if __name__ == "__main__":
