@@ -1,8 +1,10 @@
 """
 main.py
 =======
-Async orchestrator with Smart Money Following Strategy
-Based on polyclaudescraper insights - follow top holders with high PnL
+Polymarket Sniper v2 - FULL COPY TRADING
+Copies ALL positions from target wallet across ALL markets
+Target: 0x63ce342161250d705dc0b16df89036c8e5f9ba9a
+Profile: https://polymarket.com/@0x8dxd
 """
 
 import asyncio
@@ -10,14 +12,14 @@ import logging
 import os
 import sys
 import time
-import shutil
 import requests
 from dataclasses import dataclass
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Tuple
+from datetime import datetime
+from collections import defaultdict
 
 import yaml
 from dotenv import load_dotenv
-from datetime import datetime
 
 from core.state import SharedState
 from core.binance_listener import BinanceListener
@@ -34,7 +36,6 @@ from risk.fee_calculator import FeeCalculator
 from utils.logger import setup_logging
 from utils.metrics import MetricsTracker
 
-
 load_dotenv()
 
 
@@ -47,348 +48,398 @@ def load_config(path: str = "config.yaml") -> dict:
 
 
 cfg = load_config()
-PAPER_TRADE  = cfg.get("paper_trade", True)
+PAPER_TRADE = cfg.get("paper_trade", True)
 TRADING_MODE = cfg.get("strategy", {}).get("mode", "dual")
-LOG_LEVEL    = cfg.get("log_level", "INFO")
-LOG_FILE     = cfg.get("log_file", "logs/bot.log")
-LOOP_MS      = 0.05
+LOG_LEVEL = cfg.get("log_level", "INFO")
+LOG_FILE = cfg.get("log_file", "logs/bot.log")
+LOOP_MS = 0.05
 
 # ============================================================================
-# COLOR SCHEME - Neon Theme from polyclaudescraper
+# TARGET WALLET CONFIGURATION
+# ============================================================================
+
+TARGET_WALLET = "0x63ce342161250d705dc0b16df89036c8e5f9ba9a"
+TARGET_PROFILE = "https://polymarket.com/@0x8dxd"
+DATA_API = "https://data-api.polymarket.com"
+GAMMA_API = "https://gamma-api.polymarket.com"
+
+
+# ============================================================================
+# COLOR SCHEME
 # ============================================================================
 
 class Colors:
-    """ANSI color codes for terminal"""
     RESET = "\033[0m"
     BOLD = "\033[1m"
     DIM = "\033[2m"
-
-    # Neon theme
-    CYAN = "\033[96m"      # YES / UP
-    MAGENTA = "\033[95m"   # NO / DOWN
-    GREEN = "\033[92m"     # Positive PnL
-    RED = "\033[91m"       # Negative PnL
-    YELLOW = "\033[93m"    # Warnings
-    BLUE = "\033[94m"      # Info
-    WHITE = "\033[97m"     # Text
-    GRAY = "\033[90m"      # Muted
-
-    # Backgrounds
-    BG_BLACK = "\033[40m"
-    BG_GREEN = "\033[42m"
-    BG_RED = "\033[41m"
+    CYAN = "\033[96m"
+    MAGENTA = "\033[95m"
+    GREEN = "\033[92m"
+    RED = "\033[91m"
+    YELLOW = "\033[93m"
+    BLUE = "\033[94m"
+    WHITE = "\033[97m"
+    GRAY = "\033[90m"
+    ORANGE = "\033[38;5;208m"
 
 
 # ============================================================================
-# SMART MONEY DATA FETCHER (From polyclaudescraper)
+# COPY TRADING DATA FETCHER
 # ============================================================================
 
 @dataclass
-class SmartHolder:
-    """Top holder with PnL data"""
+class TargetPosition:
+    """Position held by target wallet"""
+    condition_id: str
+    market_title: str
     outcome: str
-    wallet: str
-    shares: int
+    size: float
+    avg_price: float
+    current_price: float
     pnl: float
-    pnl_display: str
-    username: Optional[str]
-
-    @property
-    def is_profitable(self) -> bool:
-        return self.pnl > 10000  # $10k+ all-time PnL
+    token_id: str
+    slug: str
+    market_url: str
+    last_updated: float
 
     @property
     def position_value(self) -> float:
-        # Approximate position value (shares * avg price ~0.5)
-        return self.shares * 0.5
+        return self.size * self.current_price
 
 
-class SmartMoneyFetcher:
+@dataclass
+class TargetTrade:
+    """Recent trade by target wallet"""
+    timestamp: str
+    market_title: str
+    side: str
+    outcome: str
+    size: float
+    price: float
+    value: float
+    condition_id: str
+
+
+class CopyTradingFetcher:
     """
-    Fetches top holders and their PnL from Polymarket.
-    Based on polyclaudescraper methodology.
+    Fetches ALL positions and trades from target wallet using Polymarket Data API.
+    Tracks positions across ALL markets, not just current BTC market.
     """
 
-    GAMMA_API = "https://gamma-api.polymarket.com"
-
-    def __init__(self):
+    def __init__(self, wallet_address: str):
+        self.wallet = wallet_address
         self.session = requests.Session()
         self.session.headers.update({
             'Accept': 'application/json',
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.0'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
         })
-        self.cache = {}
+        self.all_positions: Dict[str, TargetPosition] = {}  # key: condition_id_outcome
+        self.position_history: List[Dict] = []
         self.last_fetch = 0
+        self.total_value = 0.0
+        self.total_pnl = 0.0
 
-    def fetch_holders(self, condition_id: str, top_n: int = 20) -> List[SmartHolder]:
-        """
-        Fetch top holders for YES/NO outcomes.
-        Returns sorted list by conviction (shares * holder quality).
-        """
-        if not condition_id:
-            return []
-
-        # Rate limiting - cache for 30 seconds
-        cache_key = f"{condition_id}_{top_n}"
-        if cache_key in self.cache and (time.time() - self.last_fetch) < 30:
-            return self.cache[cache_key]
-
-        holders = []
-
+    def fetch_all_positions(self) -> Dict[str, TargetPosition]:
+        """Fetch ALL current positions of target wallet across ALL markets."""
         try:
-            # Get market info
-            market_url = f"{self.GAMMA_API}/markets"
-            params = {"condition_id": condition_id}
-            resp = self.session.get(market_url, params=params, timeout=10)
-            markets = resp.json()
+            url = f"{DATA_API}/positions"
+            params = {
+                "user": self.wallet,
+                "sizeThreshold": 0.1,  # Include smaller positions
+                "limit": 500  # Max limit to get all
+            }
 
-            if not markets:
-                return []
+            resp = self.session.get(url, params=params, timeout=15)
+            data = resp.json()
 
-            market = markets[0]
-            clob_token_ids = market.get("clobTokenIds", [])
+            new_positions = {}
+            self.total_value = 0.0
+            self.total_pnl = 0.0
 
-            if len(clob_token_ids) < 2:
-                return []
+            for pos in data:
+                condition_id = pos.get('conditionId', '')
+                outcome = pos.get('outcome', 'Unknown')
+                key = f"{condition_id}_{outcome}"
 
-            yes_token, no_token = clob_token_ids[0], clob_token_ids[1]
+                # Get market info
+                market_info = self._get_market_info(condition_id)
 
-            # Fetch YES holders
-            yes_holders = self._fetch_token_holders(yes_token, "YES", top_n)
-            holders.extend(yes_holders)
+                position = TargetPosition(
+                    condition_id=condition_id,
+                    market_title=pos.get('title', 'Unknown Market'),
+                    outcome=outcome,
+                    size=float(pos.get('size', 0)),
+                    avg_price=float(pos.get('avgPrice', 0)),
+                    current_price=float(pos.get('price', 0)),
+                    pnl=float(pos.get('cashPnl', 0)),
+                    token_id=pos.get('assetId', ''),
+                    slug=market_info.get('slug', ''),
+                    market_url=market_info.get('url', ''),
+                    last_updated=time.time()
+                )
 
-            # Fetch NO holders
-            no_holders = self._fetch_token_holders(no_token, "NO", top_n)
-            holders.extend(no_holders)
+                new_positions[key] = position
+                self.total_value += position.position_value
+                self.total_pnl += position.pnl
 
-            # Sort by conviction (shares * quality score)
-            holders.sort(key=lambda h: h.shares * (1 if h.is_profitable else 0.5), reverse=True)
+            # Detect changes
+            self._detect_changes(new_positions)
 
-            self.cache[cache_key] = holders
+            self.all_positions = new_positions
             self.last_fetch = time.time()
 
+            return self.all_positions
+
         except Exception as e:
-            logging.getLogger("smart_money").error(f"Fetch error: {e}")
+            logging.getLogger("copy_trader").error(f"Fetch all positions error: {e}")
+            return self.all_positions
 
-        return holders
+    def _detect_changes(self, new_positions: Dict[str, TargetPosition]):
+        """Detect position changes for copy trading signals."""
+        # Find new positions
+        for key, pos in new_positions.items():
+            if key not in self.all_positions:
+                # New position opened
+                self.position_history.append({
+                    'time': time.time(),
+                    'action': 'OPEN',
+                    'position': pos,
+                    'message': f"NEW: {pos.market_title[:40]} | {pos.outcome} | {pos.size:.2f} shares"
+                })
 
-    def _fetch_token_holders(self, token_id: str, outcome: str, top_n: int) -> List[SmartHolder]:
-        """Fetch holders for specific token."""
-        holders = []
+        # Find closed positions
+        for key, pos in self.all_positions.items():
+            if key not in new_positions:
+                # Position closed
+                self.position_history.append({
+                    'time': time.time(),
+                    'action': 'CLOSE',
+                    'position': pos,
+                    'message': f"CLOSED: {pos.market_title[:40]} | {pos.outcome} | PnL: ${pos.pnl:+.2f}"
+                })
 
+    def fetch_recent_trades(self, limit: int = 20) -> List[TargetTrade]:
+        """Fetch recent trades of target wallet."""
         try:
-            url = f"{self.GAMMA_API}/portfolio/history"
+            url = f"{DATA_API}/trades"
             params = {
-                "asset_id": token_id,
-                "limit": top_n * 2  # Fetch extra for filtering
+                "user": self.wallet,
+                "limit": limit,
+                "takerOnly": "false"
             }
 
             resp = self.session.get(url, params=params, timeout=10)
             data = resp.json()
 
-            for item in data.get("history", [])[:top_n]:
-                wallet = item.get("user", "")
-                shares = int(item.get("size", 0))
-
-                # Skip if no real position
-                if shares < 100:
-                    continue
-
-                # Fetch PnL (simplified - in real implementation scrape profile)
-                pnl = self._estimate_pnl(wallet)
-
-                holders.append(SmartHolder(
-                    outcome=outcome,
-                    wallet=wallet[:8] + "..." if len(wallet) > 12 else wallet,
-                    shares=shares,
-                    pnl=pnl,
-                    pnl_display=f"${pnl/1000:.1f}K" if abs(pnl) > 1000 else f"${pnl:.0f}",
-                    username=None
+            trades = []
+            for trade in data:
+                trades.append(TargetTrade(
+                    timestamp=trade.get('matchTime', ''),
+                    market_title=trade.get('title', 'Unknown'),
+                    side=trade.get('side', 'UNKNOWN'),
+                    outcome=trade.get('outcome', 'Unknown'),
+                    size=float(trade.get('size', 0)),
+                    price=float(trade.get('price', 0)),
+                    value=float(trade.get('size', 0)) * float(trade.get('price', 0)),
+                    condition_id=trade.get('conditionId', '')
                 ))
 
+            return trades
+
         except Exception as e:
-            logging.getLogger("smart_money").debug(f"Token fetch error: {e}")
+            logging.getLogger("copy_trader").error(f"Fetch trades error: {e}")
+            return []
 
-        return holders
+    def _get_market_info(self, condition_id: str) -> Dict:
+        """Get market slug and URL."""
+        try:
+            url = f"{GAMMA_API}/markets"
+            params = {"condition_id": condition_id}
+            resp = self.session.get(url, params=params, timeout=5)
+            markets = resp.json()
+            if markets:
+                slug = markets[0].get('slug', '')
+                return {
+                    'slug': slug,
+                    'url': f"https://polymarket.com/event/{slug}" if slug else ''
+                }
+        except:
+            pass
+        return {'slug': '', 'url': ''}
 
-    def _estimate_pnl(self, wallet: str) -> float:
-        """Estimate PnL from wallet activity (simplified)."""
-        # In real implementation, scrape https://polymarket.com/profile/{wallet}
-        # For now, return random based on wallet hash for demo
-        import hashlib
-        h = hashlib.md5(wallet.encode()).hexdigest()
-        return (int(h, 16) % 200000) - 50000  # -50k to +150k
+    def get_btc_5min_position(self) -> Optional[TargetPosition]:
+        """Get position in current BTC 5-min market if exists."""
+        for pos in self.all_positions.values():
+            if "btc" in pos.market_title.lower() and "5m" in pos.slug.lower():
+                return pos
+        return None
 
-    def calculate_smart_money_signal(self, holders: List[SmartHolder]) -> Dict[str, Any]:
-        """
-        Calculate signal based on smart money positioning.
-        Returns: {'direction': 'UP'/'DOWN', 'strength': 0-1, 'confidence': 0-1}
-        """
-        if not holders:
-            return {'direction': None, 'strength': 0, 'confidence': 0}
-
-        # Separate by outcome
-        yes_holders = [h for h in holders if h.outcome == "YES"]
-        no_holders = [h for h in holders if h.outcome == "NO"]
-
-        # Weight by PnL (smart money = profitable traders)
-        yes_weight = sum(h.shares * max(0, h.pnl/100000) for h in yes_holders)
-        no_weight = sum(h.shares * max(0, h.pnl/100000) for h in no_holders)
-
-        total_weight = yes_weight + no_weight
-        if total_weight == 0:
-            return {'direction': None, 'strength': 0, 'confidence': 0}
-
-        yes_ratio = yes_weight / total_weight
-
-        # Determine signal
-        if yes_ratio > 0.6:
-            direction = "UP"
-            strength = (yes_ratio - 0.5) * 2  # 0.2 to 1.0
-        elif yes_ratio < 0.4:
-            direction = "DOWN"
-            strength = (0.5 - yes_ratio) * 2
-        else:
-            direction = None
-            strength = 0
-
-        # Confidence based on number of profitable holders
-        profitable_yes = len([h for h in yes_holders if h.is_profitable])
-        profitable_no = len([h for h in no_holders if h.is_profitable])
-        confidence = min(1.0, (profitable_yes + profitable_no) / 10)
-
-        return {
-            'direction': direction,
-            'strength': strength,
-            'confidence': confidence,
-            'yes_ratio': yes_ratio,
-            'top_yes': yes_holders[:3],
-            'top_no': no_holders[:3]
-        }
+    def get_all_market_urls(self) -> List[str]:
+        """Get list of all market URLs with positions."""
+        urls = []
+        for pos in self.all_positions.values():
+            if pos.market_url:
+                urls.append(pos.market_url)
+        return urls
 
 
 # ============================================================================
-# COLORFUL TERMINAL DASHBOARD
+# FULL COPY TRADING DASHBOARD
 # ============================================================================
 
-class ColorfulDashboard:
+class FullCopyDashboard:
     """
-    Neon-themed dashboard with smart money insights.
-    Updates in place without scrolling.
+    Dashboard showing ALL positions from target wallet across ALL markets.
     """
 
     def __init__(self):
-        self.width = 85
-        self.height = 35
+        self.width = 95
         self.start_time = time.time()
-        self.trades = []
-        self.smart_holders = []
-        self.last_signal = {}
+        self.my_trades = []
+        self.scroll_offset = 0
+        self.selected_tab = 0  # 0: All, 1: BTC Only, 2: My Trades
 
-        # Clear and setup
         self._clear()
-        sys.stdout.write("\033[?25l")  # Hide cursor
+        sys.stdout.write("\033[?25l")
         sys.stdout.flush()
 
     def _clear(self):
         os.system('cls' if os.name == 'nt' else 'clear')
 
     def _print(self, row: int, text: str, col: int = 0):
-        """Print at specific position."""
         sys.stdout.write(f"\033[{row};{col}H{text}")
 
-    def _bar(self, ratio: float, width: int = 20) -> str:
-        """Create ASCII bar chart."""
-        filled = int(ratio * width)
-        bar = "█" * filled + "░" * (width - filled)
-        return bar
+    def _format_time(self, seconds):
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
-    def update(self, state: SharedState, metrics: MetricsTracker,
-               smart_signal: Dict, holders: List[SmartHolder]):
-        """Render full dashboard."""
+    def _truncate(self, text: str, length: int) -> str:
+        return text[:length - 3] + "..." if len(text) > length else text
+
+    def update(self, state: SharedState, fetcher: CopyTradingFetcher, copy_trader: 'FullCopyTrader'):
+        """Render full dashboard with all positions."""
         now = time.time()
         uptime = now - self.start_time
 
-        # Get data
-        binance_price = getattr(state, 'binance_btc_price', 0.0)
-        chainlink_price = getattr(state, 'rtds_chainlink_price', 0.0) or getattr(state, 'chainlink_price', 0.0)
-        ob = getattr(state, 'polymarket_orderbook', {})
-        best_bid = ob.get('bids', [[{'price': 0}]])[0][0].get('price', 0) if ob.get('bids') else 0
-        best_ask = ob.get('asks', [[{'price': 1}]])[0][0].get('price', 1) if ob.get('asks') else 1
+        positions = list(fetcher.all_positions.values())
+        history = fetcher.position_history[-10:]  # Last 10 changes
+
+        # Get BTC 5-min specific
+        btc_position = fetcher.get_btc_5min_position()
+        btc_price = getattr(state, 'binance_btc_price', 0.0)
+
+        lines = []
 
         # Header
-        lines = []
         lines.append(f"{Colors.CYAN}{'═' * self.width}{Colors.RESET}")
-        lines.append(f"{Colors.BOLD}{Colors.WHITE}  POLYMARKET SNIPER v2  {Colors.CYAN}■{Colors.MAGENTA}■{Colors.GREEN}■{Colors.RESET}  {'PAPER TRADE' if PAPER_TRADE else 'LIVE TRADING'}  uptime {int(uptime//3600):02d}:{int((uptime%3600)//60):02d}:{int(uptime%60):02d}{Colors.RESET}")
+        lines.append(
+            f"{Colors.BOLD}{Colors.WHITE}  POLYMARKET COPY TRADER - ALL MARKETS{Colors.RESET}  {Colors.GREEN}● LIVE{Colors.RESET}")
         lines.append(f"{Colors.CYAN}{'═' * self.width}{Colors.RESET}")
 
-        # Market Status
-        token_short = state.active_token_id[:14] + ".." if state.active_token_id else "None"
-        time_remaining = getattr(state, 'seconds_remaining', 0)
-
-        lines.append(f"{Colors.BLUE}  MARKET:{Colors.RESET} {token_short}  {Colors.YELLOW}T-{time_remaining}s{Colors.RESET}")
-        lines.append(f"{Colors.BLUE}  PRICE:{Colors.RESET}  {Colors.GREEN}${binance_price:,.2f}{Colors.RESET} (Binance)  {Colors.CYAN}${chainlink_price:,.2f}{Colors.RESET} (Chainlink)")
-        lines.append(f"{Colors.BLUE}  BOOK:{Colors.RESET}   {Colors.GREEN}bid={best_bid:.4f}{Colors.RESET}  {Colors.RED}ask={best_ask:.4f}{Colors.RESET}  spread={best_ask-best_bid:.4f}")
+        # Target Info
+        lines.append(f"{Colors.MAGENTA}  TARGET WALLET:{Colors.RESET} {Colors.YELLOW}{TARGET_WALLET}{Colors.RESET}")
+        lines.append(f"{Colors.MAGENTA}  PROFILE:{Colors.RESET}       {Colors.BLUE}{TARGET_PROFILE}{Colors.RESET}")
+        lines.append(
+            f"{Colors.MAGENTA}  MODE:{Colors.RESET}          {Colors.GREEN}PAPER TRADING (Copying ALL positions){Colors.RESET}")
         lines.append("")
 
-        # Smart Money Section
-        lines.append(f"{Colors.MAGENTA}  ▼ SMART MONEY SIGNAL{Colors.RESET}")
-        lines.append(f"{Colors.GRAY}  {'─' * 40}{Colors.RESET}")
+        # Portfolio Summary
+        lines.append(f"{Colors.GREEN}  ▼ PORTFOLIO SUMMARY{Colors.RESET}")
+        lines.append(f"{Colors.GRAY}  {'─' * 70}{Colors.RESET}")
+        lines.append(f"  Total Positions: {Colors.WHITE}{len(positions)}{Colors.RESET}")
+        lines.append(f"  Total Value:     {Colors.CYAN}${fetcher.total_value:,.2f}{Colors.RESET}")
+        lines.append(
+            f"  Total P&L:       {Colors.GREEN if fetcher.total_pnl >= 0 else Colors.RED}${fetcher.total_pnl:+.2f}{Colors.RESET}")
+        lines.append("")
 
-        if smart_signal.get('direction'):
-            dir_color = Colors.GREEN if smart_signal['direction'] == 'UP' else Colors.RED
-            strength_bar = self._bar(smart_signal['strength'])
-            conf_bar = self._bar(smart_signal['confidence'])
+        # BTC 5-Min Market (Current Focus)
+        lines.append(f"{Colors.YELLOW}  ▼ CURRENT BTC 5-MIN MARKET{Colors.RESET}")
+        lines.append(f"{Colors.GRAY}  {'─' * 70}{Colors.RESET}")
 
-            lines.append(f"  Signal: {dir_color}{Colors.BOLD}{smart_signal['direction']}{Colors.RESET}  Strength: {strength_bar} {smart_signal['strength']:.0%}")
-            lines.append(f"  Confidence: {conf_bar} {smart_signal['confidence']:.0%}")
-            lines.append(f"  YES Ratio: {smart_signal['yes_ratio']:.1%}")
+        if btc_position:
+            url = btc_position.market_url
+            lines.append(f"  {Colors.CYAN}URL:{Colors.RESET} {url}")
+            lines.append(f"  Market:  {Colors.WHITE}{self._truncate(btc_position.market_title, 50)}{Colors.RESET}")
+            out_color = Colors.GREEN if btc_position.outcome == "Yes" else Colors.RED
+            lines.append(
+                f"  Target:  {out_color}{btc_position.outcome}{Colors.RESET} | {btc_position.size:.2f} shares @ {btc_position.current_price:.4f}")
+            lines.append(
+                f"  BTC Price: ${btc_price:,.2f} | Position PnL: {Colors.GREEN if btc_position.pnl >= 0 else Colors.RED}${btc_position.pnl:+.2f}{Colors.RESET}")
         else:
-            lines.append(f"  {Colors.YELLOW}No clear signal - balanced positioning{Colors.RESET}")
+            lines.append(f"  {Colors.GRAY}No BTC 5-min position found{Colors.RESET}")
+            # Show current market URL anyway
+            if hasattr(state, 'market_end_ts') and state.market_end_ts:
+                timestamp = int(state.market_end_ts)
+                url = f"https://polymarket.com/event/btc-updown-5m-{timestamp}"
+                lines.append(f"  {Colors.CYAN}Current Market:{Colors.RESET} {url}")
 
         lines.append("")
 
-        # Top Holders Table
-        lines.append(f"{Colors.CYAN}  ▼ TOP HOLDERS (by conviction){Colors.RESET}")
-        lines.append(f"{Colors.GRAY}  {'─' * 60}{Colors.RESET}")
-        lines.append(f"  {Colors.BOLD}{'Outcome':<8} {'Wallet':<14} {'Shares':>10} {'PnL':>12} {'Quality':>8}{Colors.RESET}")
+        # ALL Positions Table
+        lines.append(f"{Colors.YELLOW}  ▼ ALL TARGET POSITIONS (Across All Markets){Colors.RESET}")
+        lines.append(f"{Colors.GRAY}  {'─' * 90}{Colors.RESET}")
 
-        for h in holders[:6]:
-            pnl_color = Colors.GREEN if h.pnl > 0 else Colors.RED
-            quality = "★★★" if h.is_profitable else "★☆☆"
-            outcome_color = Colors.GREEN if h.outcome == "YES" else Colors.RED
+        if positions:
+            # Header
+            lines.append(
+                f"  {Colors.BOLD}{'Market':<30} {'Outcome':<8} {'Size':>10} {'Price':>8} {'Value':>12} {'PnL':>12} {'URL':>20}{Colors.RESET}")
+            lines.append(f"  {Colors.GRAY}{'─' * 90}{Colors.RESET}")
 
-            lines.append(f"  {outcome_color}{h.outcome:<8}{Colors.RESET} {Colors.WHITE}{h.wallet:<14}{Colors.RESET} {h.shares:>10,} {pnl_color}{h.pnl_display:>12}{Colors.RESET} {Colors.YELLOW}{quality:>8}{Colors.RESET}")
+            # Sort by value (largest first)
+            sorted_positions = sorted(positions, key=lambda p: p.position_value, reverse=True)
+
+            for pos in sorted_positions[:8]:  # Show top 8
+                pnl_color = Colors.GREEN if pos.pnl >= 0 else Colors.RED
+                out_color = Colors.GREEN if pos.outcome == "Yes" else Colors.RED
+                url_short = pos.slug[:17] + "..." if len(pos.slug) > 20 else pos.slug
+
+                lines.append(f"  {self._truncate(pos.market_title, 29):<30} {out_color}{pos.outcome:<8}{Colors.RESET} "
+                             f"{pos.size:>10.2f} {pos.current_price:>8.4f} "
+                             f"{Colors.CYAN}${pos.position_value:>11.2f}{Colors.RESET} "
+                             f"{pnl_color}${pos.pnl:>+11.2f}{Colors.RESET} "
+                             f"{Colors.BLUE}{url_short:>20}{Colors.RESET}")
+        else:
+            lines.append(f"  {Colors.GRAY}Loading positions...{Colors.RESET}")
 
         lines.append("")
 
-        # Trade Summary
-        total_pnl = sum(t.get('pnl', 0) for t in self.trades)
-        wins = len([t for t in self.trades if t.get('pnl', 0) > 0])
-        total = len(self.trades)
+        # Recent Activity
+        lines.append(f"{Colors.ORANGE}  ▼ RECENT ACTIVITY (Position Changes){Colors.RESET}")
+        lines.append(f"{Colors.GRAY}  {'─' * 70}{Colors.RESET}")
 
-        lines.append(f"{Colors.YELLOW}  ▼ TRADE PERFORMANCE{Colors.RESET}")
-        lines.append(f"{Colors.GRAY}  {'─' * 40}{Colors.RESET}")
-        pnl_color = Colors.GREEN if total_pnl >= 0 else Colors.RED
-        lines.append(f"  Total Trades: {total}  |  Wins: {Colors.GREEN}{wins}{Colors.RESET}  |  Losses: {Colors.RED}{total-wins}{Colors.RESET}")
-        lines.append(f"  Total P&L: {pnl_color}${total_pnl:+.2f}{Colors.RESET}  |  Win Rate: {(wins/total*100) if total else 0:.1f}%")
+        if history:
+            for item in history[-5:]:
+                action_color = Colors.GREEN if item['action'] == 'OPEN' else Colors.RED
+                time_str = datetime.fromtimestamp(item['time']).strftime('%H:%M:%S')
+                lines.append(f"  [{time_str}] {action_color}{item['action']}{Colors.RESET}: {item['message']}")
+        else:
+            lines.append(f"  {Colors.GRAY}Waiting for changes...{Colors.RESET}")
+
         lines.append("")
 
-        # Recent Trades
-        lines.append(f"{Colors.YELLOW}  ▼ RECENT TRADES{Colors.RESET}")
-        lines.append(f"{Colors.GRAY}  {'─' * 40}{Colors.RESET}")
+        # My Copy Trades
+        total_my_pnl = sum(t.get('pnl', 0) for t in self.my_trades)
+        lines.append(f"{Colors.CYAN}  ▼ MY COPY TRADES{Colors.RESET}")
+        lines.append(f"{Colors.GRAY}  {'─' * 70}{Colors.RESET}")
+        lines.append(
+            f"  Total: {len(self.my_trades)} trades | P&L: {Colors.GREEN if total_my_pnl >= 0 else Colors.RED}${total_my_pnl:+.2f}{Colors.RESET}")
 
-        if self.trades:
-            for t in self.trades[-3:]:
+        if self.my_trades:
+            for t in self.my_trades[-3:]:
                 dir_color = Colors.GREEN if t['direction'] == 'UP' else Colors.RED
                 pnl_color = Colors.GREEN if t.get('pnl', 0) >= 0 else Colors.RED
-                lines.append(f"  {dir_color}{t['direction']:<6}{Colors.RESET} @ {t.get('price', 0):.4f}  PnL: {pnl_color}${t.get('pnl', 0):+.2f}{Colors.RESET}  [{t.get('reason', '')}]")
+                market = self._truncate(t.get('market', 'Unknown'), 25)
+                lines.append(f"  {dir_color}{t['direction']:<6}{Colors.RESET} {market:<25} @ {t.get('price', 0):.4f} "
+                             f"PnL: {pnl_color}${t.get('pnl', 0):+.2f}{Colors.RESET} [{t.get('reason', '')}]")
         else:
-            lines.append(f"  {Colors.GRAY}No trades yet...{Colors.RESET}")
+            lines.append(f"  {Colors.GRAY}No copy trades executed yet...{Colors.RESET}")
 
         lines.append("")
         lines.append(f"{Colors.CYAN}{'═' * self.width}{Colors.RESET}")
-        lines.append(f"  {Colors.GRAY}Press Ctrl+C to stop{Colors.RESET}  |  {Colors.GRAY}Log: logs/bot.log{Colors.RESET}")
+        lines.append(
+            f"  {Colors.GRAY}Uptime: {self._format_time(uptime)} | Positions update every 10s | Ctrl+C to stop{Colors.RESET}")
 
         # Render
         self._clear()
@@ -398,35 +449,34 @@ class ColorfulDashboard:
         sys.stdout.flush()
 
     def add_trade(self, trade: Dict):
-        self.trades.append(trade)
-        if len(self.trades) > 20:
-            self.trades = self.trades[-20:]
+        self.my_trades.append(trade)
+        if len(self.my_trades) > 50:
+            self.my_trades = self.my_trades[-50:]
 
     def close(self):
-        sys.stdout.write("\033[?25h")  # Show cursor
+        sys.stdout.write("\033[?25h")
         sys.stdout.flush()
 
 
 # ============================================================================
-# SMART MONEY STRATEGY
+# FULL COPY TRADER - ALL MARKETS
 # ============================================================================
 
-class SmartMoneyStrategy:
+class FullCopyTrader:
     """
-    Strategy based on polyclaudescraper insights:
-    Follow top holders with proven track records (high all-time PnL).
+    Copies ALL positions from target wallet across ALL markets.
+    Not limited to BTC 5-min markets.
     """
 
     def __init__(
-        self,
-        state: SharedState,
-        executor: PolyExecutor,
-        risk_mgr: RiskManager,
-        metrics: MetricsTracker,
-        dashboard: ColorfulDashboard,
-        paper_trade: bool = True,
-        min_confidence: float = 0.6,
-        entry_threshold: float = 0.65,  # YES/NO ratio threshold
+            self,
+            state: SharedState,
+            executor: PolyExecutor,
+            risk_mgr: RiskManager,
+            metrics: MetricsTracker,
+            dashboard: FullCopyDashboard,
+            paper_trade: bool = True,
+            copy_scale: float = 0.1,  # Copy 10% of target size
     ):
         self.state = state
         self.executor = executor
@@ -434,356 +484,159 @@ class SmartMoneyStrategy:
         self.metrics = metrics
         self.dashboard = dashboard
         self.paper_trade = paper_trade
-        self.min_confidence = min_confidence
-        self.entry_threshold = entry_threshold
+        self.copy_scale = copy_scale
 
-        self.fetcher = SmartMoneyFetcher()
-        self.active_position = None
+        self.fetcher = CopyTradingFetcher(TARGET_WALLET)
+        self.status = "INITIALIZING"
         self.running = False
-        self.last_update = 0
 
-        self.logger = logging.getLogger("strategy.smart_money")
-        self.logger.info("SmartMoneyStrategy initialized")
+        # Track our copied positions
+        self.my_positions: Dict[str, Dict] = {}  # key: condition_id_outcome
 
-    def _get_polymarket_mid(self) -> Optional[float]:
-        ob = getattr(self.state, 'polymarket_orderbook', None)
-        if ob and 'bids' in ob and 'asks' in ob:
-            best_bid = ob['bids'][0]['price'] if ob['bids'] else 0
-            best_ask = ob['asks'][0]['price'] if ob['asks'] else 1
-            return (best_bid + best_ask) / 2
-        return None
+        self.logger = logging.getLogger("full_copy_trader")
+        self.logger.info(f"FullCopyTrader initialized for {TARGET_WALLET[:20]}...")
+        self.logger.info(f"Copy scale: {copy_scale * 100}% of target position size")
 
     async def run(self):
-        """Main strategy loop."""
-        self.logger.info("SmartMoneyStrategy starting...")
+        """Main loop - copy ALL positions."""
+        self.logger.info("FullCopyTrader starting...")
         self.running = True
+        self.status = "MONITORING"
 
         while self.running:
             try:
-                now = time.time()
+                # Fetch all target positions
+                target_positions = self.fetcher.fetch_all_positions()
 
-                # Update smart money data every 15 seconds
-                if now - self.last_update > 15:
-                    condition_id = getattr(self.state, 'active_condition_id', None)
-                    if condition_id:
-                        holders = self.fetcher.fetch_holders(condition_id, top_n=15)
-                        signal = self.fetcher.calculate_smart_money_signal(holders)
-
-                        self.dashboard.smart_holders = holders
-                        self.dashboard.last_signal = signal
-
-                        # Check for entry/exit
-                        await self._check_signal(signal)
-
-                        self.last_update = now
-
-                # Manage existing position
-                if self.active_position:
-                    await self._manage_position()
-
-                await asyncio.sleep(1)
-
-            except Exception as e:
-                self.logger.error(f"Strategy error: {e}")
-                await asyncio.sleep(5)
-
-    async def _check_signal(self, signal: Dict):
-        """Check if we should enter based on smart money signal."""
-        if self.active_position:
-            return
-
-        if not signal.get('direction') or signal['confidence'] < self.min_confidence:
-            return
-
-        # Additional check: only enter if strength is high enough
-        if signal['strength'] < self.entry_threshold - 0.5:
-            return
-
-        # Calculate position size based on confidence
-        size = self.risk_mgr.calculate_position_size(
-            confidence=signal['confidence'],
-            time_pressure=0.5
-        )
-
-        direction = signal['direction']
-        current = self._get_polymarket_mid() or 0.5
-
-        # Entry with slight slippage
-        entry = current + (0.001 if direction == 'UP' else -0.001)
-
-        token_id = (self.state.active_token_id if direction == 'UP'
-                   else self.state.active_token_down)
-
-        self.logger.info(f"SMART MONEY ENTRY: {direction} @ {entry:.4f} "
-                        f"(conf: {signal['confidence']:.2f}, strength: {signal['strength']:.2f})")
-
-        self.active_position = {
-            'direction': direction,
-            'entry_price': entry,
-            'entry_time': time.time(),
-            'size': size,
-            'token_id': token_id,
-            'signal': signal,
-            'target': entry + 0.03 if direction == 'UP' else entry - 0.03,
-            'stop': entry - 0.05 if direction == 'UP' else entry + 0.05,
-        }
-
-        self.dashboard.add_trade({
-            'direction': direction,
-            'price': entry,
-            'pnl': 0,
-            'reason': f"smart_money_{signal['confidence']:.0%}",
-            'open': True
-        })
-
-        if not self.paper_trade:
-            try:
-                await self.executor.place_order(
-                    token_id=token_id,
-                    price=entry,
-                    size=size,
-                    side='BUY',
-                    order_type='FOK'
-                )
-            except Exception as e:
-                self.logger.error(f"Entry failed: {e}")
-                self.active_position = None
-
-    async def _manage_position(self):
-        """Manage open position."""
-        pos = self.active_position
-        current = self._get_polymarket_mid()
-
-        if not current:
-            return
-
-        # Calculate P&L
-        if pos['direction'] == 'UP':
-            pnl = current - pos['entry_price']
-            hit_target = current >= pos['target']
-            hit_stop = current <= pos['stop']
-        else:
-            pnl = pos['entry_price'] - current
-            hit_target = current <= pos['target']
-            hit_stop = current >= pos['stop']
-
-        hold_time = time.time() - pos['entry_time']
-        max_hold = 60  # 60 second max hold
-
-        if hit_target or hit_stop or hold_time > max_hold:
-            reason = 'target' if hit_target else ('stop' if hit_stop else 'timeout')
-
-            self.logger.info(f"EXIT: {pos['direction']} @ {current:.4f} "
-                            f"PnL: ${pnl:+.2f} ({reason})")
-
-            if not self.paper_trade:
-                try:
-                    await self.executor.place_order(
-                        token_id=pos['token_id'],
-                        price=current,
-                        size=pos['size'],
-                        side='SELL',
-                        order_type='IOC'
-                    )
-                except Exception as e:
-                    self.logger.error(f"Exit error: {e}")
-
-            self.dashboard.add_trade({
-                'direction': pos['direction'],
-                'price': current,
-                'pnl': pnl,
-                'reason': reason,
-                'open': False
-            })
-
-            self.risk_mgr.update_after_trade(pnl)
-            self.active_position = None
-
-    def stop(self):
-        self.running = False
-
-
-# ============================================================================
-# MOMENTUM SCALPER (Original)
-# ============================================================================
-
-class MomentumScalper:
-    """Original momentum strategy."""
-
-    def __init__(
-        self,
-        state: SharedState,
-        executor: PolyExecutor,
-        risk_mgr: RiskManager,
-        metrics: MetricsTracker,
-        dashboard: ColorfulDashboard,
-        paper_trade: bool = True,
-        entry_window_start: float = 210,
-        entry_window_end: float = 240,
-        min_confidence: float = 0.70,
-    ):
-        self.state = state
-        self.executor = executor
-        self.risk_mgr = risk_mgr
-        self.metrics = metrics
-        self.dashboard = dashboard
-        self.paper_trade = paper_trade
-        self.entry_window_start = entry_window_start
-        self.entry_window_end = entry_window_end
-        self.min_confidence = min_confidence
-
-        self.price_history = []
-        self.active_position = None
-        self.market_start_time = None
-        self.running = False
-
-        self.logger = logging.getLogger("strategy.momentum")
-
-    def _mean(self, data: list) -> float:
-        return sum(data) / len(data) if data else 0.0
-
-    def _get_polymarket_mid(self) -> Optional[float]:
-        ob = getattr(self.state, 'polymarket_orderbook', None)
-        if ob and 'bids' in ob and 'asks' in ob:
-            best_bid = ob['bids'][0]['price'] if ob['bids'] else 0
-            best_ask = ob['asks'][0]['price'] if ob['asks'] else 1
-            return (best_bid + best_ask) / 2
-        return None
-
-    async def run(self):
-        self.logger.info("MomentumScalper starting...")
-        self.running = True
-
-        while self.running:
-            try:
-                mid = self._get_polymarket_mid()
-                if mid:
-                    self.price_history.append({'timestamp': time.time(), 'price': mid})
-                    if len(self.price_history) > 60:
-                        self.price_history = self.price_history[-60:]
-
-                if self.market_start_time is None and self.state.market_end_ts:
-                    self.market_start_time = self.state.market_end_ts - 300
-
-                if self.market_start_time:
-                    elapsed = time.time() - self.market_start_time
-
-                    if self.active_position:
-                        await self._manage_position()
+                # Copy each position
+                for key, target_pos in target_positions.items():
+                    if key not in self.my_positions:
+                        # New position - OPEN it
+                        await self._open_position(target_pos)
                     else:
-                        signal = self._generate_signal(elapsed)
-                        if signal:
-                            await self._enter_position(signal)
+                        # Check for size changes
+                        my_pos = self.my_positions[key]
+                        size_diff = abs(target_pos.size - my_pos['target_size'])
+                        if size_diff / max(target_pos.size, 1) > 0.2:  # 20% change
+                            await self._adjust_position(target_pos, my_pos)
 
-                await asyncio.sleep(0.1)
+                # Check for closed positions
+                for key in list(self.my_positions.keys()):
+                    if key not in target_positions:
+                        await self._close_position(key)
+
+                self.status = f"TRACKING {len(target_positions)} positions"
+
+                await asyncio.sleep(10)  # Update every 10 seconds
+
             except Exception as e:
-                self.logger.error(f"Error: {e}")
-                await asyncio.sleep(1)
+                self.logger.error(f"FullCopyTrader error: {e}")
+                self.status = "ERROR"
+                await asyncio.sleep(15)
 
-    def _generate_signal(self, elapsed: float) -> Optional[Dict]:
-        if not (self.entry_window_start <= elapsed <= self.entry_window_end):
-            return None
+    async def _open_position(self, target_pos: TargetPosition):
+        """Open a new copied position."""
+        self.status = "OPENING POSITION"
 
-        # Simplified signal generation
-        if len(self.price_history) < 5:
-            return None
+        copy_size = target_pos.size * self.copy_scale
 
-        recent = [p['price'] for p in self.price_history[-5:]]
-        momentum = (recent[-1] - recent[0]) / recent[0] if recent[0] else 0
+        direction = 'UP' if target_pos.outcome == "Yes" else 'DOWN'
 
-        if abs(momentum) < 0.001:
-            return None
+        self.logger.info(f"COPYING: {target_pos.market_title[:40]} | "
+                         f"{direction} | {copy_size:.2f} shares @ {target_pos.current_price:.4f}")
 
-        direction = 'UP' if momentum > 0 else 'DOWN'
-        confidence = min(1.0, abs(momentum) * 100)
-
-        if confidence < self.min_confidence:
-            return None
-
-        current = recent[-1]
-        return {
+        trade_data = {
             'direction': direction,
-            'confidence': confidence,
-            'entry_price': current + (0.002 if direction == 'UP' else -0.002),
-            'target': current + 0.03 if direction == 'UP' else current - 0.03,
-            'stop': current - 0.05 if direction == 'UP' else current + 0.05,
+            'market': target_pos.market_title,
+            'price': target_pos.current_price,
+            'size': copy_size,
+            'target_size': target_pos.size,  # Track original
+            'pnl': 0,
+            'open': True,
+            'reason': f"copy_{TARGET_WALLET[:6]}",
+            'condition_id': target_pos.condition_id,
+            'outcome': target_pos.outcome,
+            'token_id': target_pos.token_id,
+            'market_url': target_pos.market_url
         }
 
-    async def _enter_position(self, signal: Dict):
-        if not self.risk_mgr.can_trade():
+        key = f"{target_pos.condition_id}_{target_pos.outcome}"
+        self.my_positions[key] = trade_data
+        self.dashboard.add_trade(trade_data)
+
+        if not self.paper_trade:
+            try:
+                # Determine token ID based on outcome
+                token_id = target_pos.token_id
+
+                await self.executor.place_order(
+                    token_id=token_id,
+                    price=target_pos.current_price,
+                    size=copy_size,
+                    side='BUY',
+                    order_type='FOK'
+                )
+                self.logger.info(f"Order executed: {token_id[:20]}...")
+            except Exception as e:
+                self.logger.error(f"Order failed: {e}")
+
+        self.status = "MONITORING"
+
+    async def _adjust_position(self, target_pos: TargetPosition, my_pos: Dict):
+        """Adjust position size to match target."""
+        new_size = target_pos.size * self.copy_scale
+        old_size = my_pos['size']
+
+        self.logger.info(f"ADJUSTING: {target_pos.market_title[:40]} | "
+                         f"{old_size:.2f} -> {new_size:.2f}")
+
+        my_pos['target_size'] = target_pos.size
+        my_pos['size'] = new_size
+        my_pos['price'] = target_pos.current_price
+
+    async def _close_position(self, key: str):
+        """Close a position when target closes."""
+        if key not in self.my_positions:
             return
 
-        size = self.risk_mgr.calculate_position_size(confidence=signal['confidence'])
-        token_id = (self.state.active_token_id if signal['direction'] == 'UP'
-                   else self.state.active_token_down)
+        my_pos = self.my_positions[key]
 
-        self.active_position = {
-            'direction': signal['direction'],
-            'entry_price': signal['entry_price'],
-            'entry_time': time.time(),
-            'size': size,
-            'target': signal['target'],
-            'stop': signal['stop'],
-            'token_id': token_id,
-        }
+        # Calculate PnL
+        current_price = my_pos['price']  # Simplified
+        if my_pos['direction'] == 'UP':
+            pnl = (current_price - my_pos['price']) * my_pos['size']
+        else:
+            pnl = (my_pos['price'] - current_price) * my_pos['size']
 
-        self.dashboard.add_trade({
-            'direction': signal['direction'],
-            'price': signal['entry_price'],
-            'pnl': 0,
-            'reason': 'momentum',
-            'open': True
-        })
+        self.logger.info(f"CLOSING: {my_pos['market'][:40]} | PnL: ${pnl:.2f}")
+
+        my_pos['pnl'] = pnl
+        my_pos['open'] = False
+        my_pos['reason'] = 'target_closed'
+
+        self.dashboard.add_trade(my_pos)
+        self.risk_mgr.update_after_trade(pnl)
 
         if not self.paper_trade:
             try:
                 await self.executor.place_order(
-                    token_id=token_id,
-                    price=signal['entry_price'],
-                    size=size,
-                    side='BUY',
-                    order_type='FOK'
+                    token_id=my_pos['token_id'],
+                    price=current_price,
+                    size=my_pos['size'],
+                    side='SELL',
+                    order_type='IOC'
                 )
             except Exception as e:
-                self.logger.error(f"Entry failed: {e}")
-                self.active_position = None
+                self.logger.error(f"Close order failed: {e}")
 
-    async def _manage_position(self):
-        if not self.active_position:
-            return
-
-        pos = self.active_position
-        current = self._get_polymarket_mid()
-        if not current:
-            return
-
-        if pos['direction'] == 'UP':
-            pnl = current - pos['entry_price']
-            hit_target = current >= pos['target']
-            hit_stop = current <= pos['stop']
-        else:
-            pnl = pos['entry_price'] - current
-            hit_target = current <= pos['target']
-            hit_stop = current >= pos['stop']
-
-        hold_time = time.time() - pos['entry_time']
-
-        if hit_target or hit_stop or hold_time > 45:
-            reason = 'target' if hit_target else ('stop' if hit_stop else 'timeout')
-
-            self.dashboard.add_trade({
-                'direction': pos['direction'],
-                'price': current,
-                'pnl': pnl,
-                'reason': reason,
-                'open': False
-            })
-
-            self.risk_mgr.update_after_trade(pnl)
-            self.active_position = None
+        del self.my_positions[key]
 
     def stop(self):
         self.running = False
+
+    def get_all_market_urls(self) -> List[str]:
+        """Get all market URLs being tracked."""
+        return self.fetcher.get_all_market_urls()
 
 
 # ============================================================================
@@ -802,7 +655,6 @@ def setup_file_logging(level: str, log_file: str):
     root_logger.setLevel(logging.DEBUG)
     root_logger.addHandler(file_handler)
 
-    # Remove console handlers
     for handler in list(root_logger.handlers):
         if isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler):
             root_logger.removeHandler(handler)
@@ -812,40 +664,39 @@ def setup_file_logging(level: str, log_file: str):
 # MAIN
 # ============================================================================
 
-def select_strategy():
-    print(f"\n{Colors.CYAN}{'═' * 50}{Colors.RESET}")
-    print(f"{Colors.BOLD}{Colors.WHITE}  POLYMARKET SNIPER v2 - STRATEGY SELECTOR{Colors.RESET}")
-    print(f"{Colors.CYAN}{'═' * 50}{Colors.RESET}")
-    print(f"\n  {Colors.GREEN}1.{Colors.RESET} CLASSIC    - Original taker/maker dual mode")
-    print(f"  {Colors.YELLOW}2.{Colors.RESET} MOMENTUM   - Late entry scalping (3:30-4:00)")
-    print(f"  {Colors.MAGENTA}3.{Colors.RESET} SMART MONEY- Follow top holders (from polyclaudescraper)")
-    print(f"  {Colors.CYAN}4.{Colors.RESET} ALL        - Run all strategies")
-    print(f"{Colors.CYAN}{'═' * 50}{Colors.RESET}")
+def select_mode():
+    print(f"\n{Colors.CYAN}{'═' * 60}{Colors.RESET}")
+    print(f"{Colors.BOLD}{Colors.WHITE}  POLYMARKET FULL COPY TRADER{Colors.RESET}")
+    print(f"{Colors.CYAN}{'═' * 60}{Colors.RESET}")
+    print(f"\n  {Colors.GREEN}1.{Colors.RESET} FULL COPY   - Copy ALL positions from wallet")
+    print(f"  {Colors.YELLOW}2.{Colors.RESET} BTC FOCUS   - Copy only BTC 5-min markets")
+    print(f"  {Colors.BLUE}3.{Colors.RESET} DASHBOARD   - View only (no copying)")
+    print(f"{Colors.CYAN}{'═' * 60}{Colors.RESET}")
 
     while True:
-        choice = input(f"\n  Select {Colors.BOLD}(1/2/3/4){Colors.RESET}: ").strip()
-        if choice in ["1", "2", "3", "4"]:
+        choice = input(f"\n  Select mode {Colors.BOLD}(1/2/3){Colors.RESET}: ").strip()
+        if choice in ["1", "2", "3"]:
             break
         print(f"  {Colors.RED}Invalid choice{Colors.RESET}")
 
-    strategies = {"1": "classic", "2": "momentum", "3": "smart_money", "4": "all"}
-    return strategies[choice]
+    modes = {"1": "full", "2": "btc", "3": "view"}
+    return modes[choice]
 
 
 async def main():
-    selected = select_strategy()
-    use_classic = selected in ("classic", "all")
-    use_momentum = selected in ("momentum", "all")
-    use_smart = selected in ("smart_money", "all")
+    selected_mode = select_mode()
 
     # Setup logging
     setup_file_logging(LOG_LEVEL, LOG_FILE)
     logger = logging.getLogger("main")
 
     # Create dashboard
-    dashboard = ColorfulDashboard()
+    dashboard = FullCopyDashboard()
 
-    logger.info("Starting with strategy: " + selected)
+    logger.info(f"Starting in {selected_mode} mode")
+    print(f"\n{Colors.GREEN}Starting copy trader...{Colors.RESET}")
+    print(f"{Colors.GRAY}Target: {TARGET_WALLET}{Colors.RESET}")
+    print(f"{Colors.GRAY}Profile: {TARGET_PROFILE}{Colors.RESET}\n")
 
     # Initialize components
     state = SharedState()
@@ -861,28 +712,14 @@ async def main():
     state.current_balance = balance
     risk_mgr = RiskManager(starting_balance=balance)
 
-    # Initialize strategies
-    strategies = []
+    # Initialize copy trader
+    copy_trader = FullCopyTrader(
+        state, executor, risk_mgr, metrics, dashboard,
+        paper_trade=PAPER_TRADE,
+        copy_scale=0.1  # 10% of target size
+    )
 
-    if use_momentum:
-        momentum = MomentumScalper(
-            state, executor, risk_mgr, metrics, dashboard, PAPER_TRADE
-        )
-        strategies.append(momentum)
-
-    if use_smart:
-        smart = SmartMoneyStrategy(
-            state, executor, risk_mgr, metrics, dashboard, PAPER_TRADE
-        )
-        strategies.append(smart)
-
-    # Classic mode
-    taker = maker = None
-    if use_classic:
-        taker = TakerSniper(state, executor, risk_mgr, metrics, paper_trade=PAPER_TRADE)
-        maker = MakerQuoter(state, executor, metrics, paper_trade=PAPER_TRADE)
-
-    # Fetch initial market
+    # Fetch initial market for BTC price context
     initial = await finder.fetch_once()
     if initial:
         state.active_token_id = initial["_token_up"]
@@ -902,16 +739,14 @@ async def main():
     # Dashboard updater
     async def dashboard_updater():
         while True:
-            signal = dashboard.last_signal if hasattr(dashboard, 'last_signal') else {}
-            holders = dashboard.smart_holders if hasattr(dashboard, 'smart_holders') else []
-            dashboard.update(state, metrics, signal, holders)
+            dashboard.update(state, copy_trader.fetcher, copy_trader)
             await asyncio.sleep(0.5)
 
     tasks.append(asyncio.create_task(dashboard_updater()))
 
-    # Strategy tasks
-    for strat in strategies:
-        tasks.append(asyncio.create_task(strat.run()))
+    # Copy trader task
+    if selected_mode in ["full", "btc"]:
+        tasks.append(asyncio.create_task(copy_trader.run()))
 
     try:
         await asyncio.gather(*tasks)
@@ -919,8 +754,8 @@ async def main():
         pass
     finally:
         dashboard.close()
-        for strat in strategies:
-            strat.stop()
+        copy_trader.stop()
+        logger.info("Shutdown complete")
 
 
 if __name__ == "__main__":
