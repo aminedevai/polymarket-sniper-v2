@@ -405,6 +405,24 @@ def _append_collector_row(row:dict):
     with open(COLLECTOR_FILE,'a',newline='',encoding='utf-8') as f:
         csv.DictWriter(f,fieldnames=list(row.keys())).writerow(row)
 
+def _backfill_outcome(slug:str, outcome:str):
+    """Update outcome field for all rows of this slug in the CSV."""
+    if not os.path.exists(COLLECTOR_FILE): return
+    try:
+        with open(COLLECTOR_FILE,'r',newline='',encoding='utf-8') as f:
+            rows=list(csv.DictReader(f))
+            fieldnames=list(rows[0].keys()) if rows else []
+        updated=False
+        for r in rows:
+            if r['slug']==slug and not r.get('outcome'):
+                r['outcome']=outcome; updated=True
+        if updated:
+            with open(COLLECTOR_FILE,'w',newline='',encoding='utf-8') as f:
+                w=csv.DictWriter(f,fieldnames=fieldnames)
+                w.writeheader(); w.writerows(rows)
+    except Exception as e:
+        logging.getLogger("collector").error(f"Backfill: {e}")
+
 def _fetch_market(slug:str)->tuple:
     """Returns (up_price, outcome, volume)."""
     try:
@@ -439,7 +457,17 @@ class _MarketTracker:
     def tick(self,sniper:SniperTester,logger)->Optional[str]:
         secs=self.secs_left()
         target=next((s for s in COLLECTOR_SNAPS if secs<=s+15 and s not in self.recorded),None)
-        if target is None: return None
+        if target is None:
+            # After expiry: keep polling for outcome until we get it
+            if self.expired() and not self.outcome:
+                up_price,outcome,volume=_fetch_market(self.slug)
+                if outcome:
+                    self.outcome=outcome
+                    _backfill_outcome(self.slug, outcome)
+                    sniper.on_outcome(self.slug,outcome)
+                    logger.info(f"OUTCOME BACKFILL {self.slug[-10:]} → {outcome}")
+                    return f"RESOLVED {self.slug[-10:]} → {outcome}"
+            return None
         up_price,outcome,volume=_fetch_market(self.slug)
         if up_price is not None or outcome is not None:
             row={'recorded_at':datetime.now(timezone.utc).isoformat(),'slug':self.slug,
@@ -448,13 +476,17 @@ class _MarketTracker:
                  'outcome':outcome or ''}
             _append_collector_row(row)
             self.recorded.add(target)
-            # Feed sniper
             if up_price: sniper.on_snapshot(self.slug,up_price,volume,target)
         if outcome and not self.outcome:
             self.outcome=outcome
+            _backfill_outcome(self.slug, outcome)
             sniper.on_outcome(self.slug,outcome)
             return f"RESOLVED {self.slug[-10:]} → {outcome}"
         return None
+
+    def expired(self)->bool:
+        # Keep tracker alive for 5 min after expiry to catch outcome
+        return time.time() > self.end_ts + 300
 
 async def _run_collector(sniper:SniperTester,logger):
     _ensure_collector_csv()
