@@ -1,0 +1,526 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>POLYMARKET TRADER</title>
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Mono:wght@300;400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg:       #080c10;
+    --surface:  #0d1117;
+    --border:   #1a2332;
+    --border2:  #243044;
+    --text:     #c9d1d9;
+    --dim:      #4a5568;
+    --green:    #39d353;
+    --red:      #f85149;
+    --yellow:   #e3b341;
+    --cyan:     #58a6ff;
+    --orange:   #f0883e;
+    --purple:   #bc8cff;
+    --accent:   #1f6feb;
+  }
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{background:var(--bg);color:var(--text);font-family:'DM Mono',monospace;font-size:13px;min-height:100vh;overflow-x:hidden}
+
+  /* Scanline overlay */
+  body::before{content:'';position:fixed;top:0;left:0;width:100%;height:100%;
+    background:repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(0,0,0,.03) 2px,rgba(0,0,0,.03) 4px);
+    pointer-events:none;z-index:9999}
+
+  .grid{display:grid;grid-template-columns:1fr 1fr;grid-template-rows:auto auto auto;gap:1px;min-height:100vh}
+
+  /* Header */
+  .header{grid-column:1/-1;background:var(--surface);border-bottom:1px solid var(--border2);
+    padding:14px 24px;display:flex;align-items:center;justify-content:space-between}
+  .header-left{display:flex;align-items:center;gap:16px}
+  .logo{font-family:'Space Mono',monospace;font-size:15px;font-weight:700;letter-spacing:.12em;color:#fff}
+  .logo span{color:var(--cyan)}
+  .badge{padding:3px 10px;border:1px solid var(--border2);border-radius:3px;font-size:11px;
+    color:var(--yellow);letter-spacing:.08em}
+  .live-dot{width:8px;height:8px;background:var(--green);border-radius:50%;
+    box-shadow:0 0 6px var(--green);animation:pulse 2s infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+  .header-right{display:flex;gap:24px;align-items:center}
+  .stat-mini{text-align:right}
+  .stat-mini .label{font-size:10px;color:var(--dim);letter-spacing:.06em}
+  .stat-mini .val{font-size:14px;font-weight:500}
+
+  /* Panels */
+  .panel{background:var(--surface);border:1px solid var(--border);padding:0;overflow:hidden}
+  .panel.wide{grid-column:1/-1}
+  .panel-header{padding:12px 18px;border-bottom:1px solid var(--border);
+    display:flex;align-items:center;gap:10px;background:rgba(255,255,255,.02)}
+  .panel-title{font-family:'Space Mono',monospace;font-size:11px;font-weight:700;
+    letter-spacing:.1em;text-transform:uppercase}
+  .panel-count{font-size:11px;color:var(--dim);margin-left:auto}
+  .panel-body{padding:16px 18px}
+
+  /* Budget cards */
+  .budget-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--border)}
+  .budget-card{background:var(--surface);padding:16px 18px}
+  .budget-card .label{font-size:10px;color:var(--dim);letter-spacing:.08em;text-transform:uppercase;margin-bottom:6px}
+  .budget-card .amount{font-family:'Space Mono',monospace;font-size:20px;font-weight:700}
+  .budget-card .sub{font-size:11px;color:var(--dim);margin-top:4px}
+
+  /* Progress bar */
+  .progress-wrap{margin:0 18px 14px;padding:10px 0;border-bottom:1px solid var(--border)}
+  .progress-labels{display:flex;justify-content:space-between;font-size:10px;color:var(--dim);margin-bottom:6px}
+  .progress-bar{height:4px;background:var(--border2);border-radius:2px;overflow:hidden}
+  .progress-fill{height:100%;background:linear-gradient(90deg,var(--accent),var(--cyan));
+    border-radius:2px;transition:width .6s ease}
+
+  /* Tables */
+  .table-wrap{overflow-x:auto}
+  table{width:100%;border-collapse:collapse;font-size:12px}
+  thead tr{border-bottom:1px solid var(--border2)}
+  thead th{padding:8px 12px;text-align:left;font-size:10px;font-weight:700;
+    letter-spacing:.08em;color:var(--dim);text-transform:uppercase;white-space:nowrap}
+  thead th.num{text-align:right}
+  tbody tr{border-bottom:1px solid rgba(255,255,255,.03);transition:background .15s}
+  tbody tr:hover{background:rgba(255,255,255,.03)}
+  tbody td{padding:9px 12px;white-space:nowrap;vertical-align:middle}
+  tbody td.num{text-align:right;font-family:'Space Mono',monospace}
+  tbody td.mono{font-family:'Space Mono',monospace}
+  .empty{padding:24px;text-align:center;color:var(--dim);font-size:12px}
+
+  .tag-up{color:var(--green)}
+  .tag-dn{color:var(--red)}
+  .pos{color:var(--green)}
+  .neg{color:var(--red)}
+  .neu{color:var(--dim)}
+  .hl-cyan{color:var(--cyan)}
+  .hl-yel{color:var(--yellow)}
+  .hl-orn{color:var(--orange)}
+  .hl-pur{color:var(--purple)}
+
+  .pill{display:inline-block;padding:2px 8px;border-radius:3px;font-size:10px;font-weight:700;letter-spacing:.04em}
+  .pill-up{background:rgba(57,211,83,.12);color:var(--green);border:1px solid rgba(57,211,83,.2)}
+  .pill-dn{background:rgba(248,81,73,.12);color:var(--red);border:1px solid rgba(248,81,73,.2)}
+  .pill-manual{background:rgba(240,136,62,.12);color:var(--orange);border:1px solid rgba(240,136,62,.2)}
+  .pill-expired{background:rgba(248,81,73,.12);color:var(--red);border:1px solid rgba(248,81,73,.2)}
+  .pill-closed{background:rgba(74,85,104,.15);color:var(--dim);border:1px solid var(--border2)}
+
+  .time-critical{color:var(--red);animation:blink .8s step-end infinite}
+  .time-warn{color:var(--orange)}
+  .time-ok{color:var(--yellow)}
+  @keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
+
+  .url-link{color:var(--accent);text-decoration:none;font-size:11px}
+  .url-link:hover{color:var(--cyan);text-decoration:underline}
+
+  /* Sniper */
+  .sniper-stats{display:grid;grid-template-columns:repeat(5,1fr);gap:1px;background:var(--border);margin-bottom:1px}
+  .sniper-stat{background:var(--surface);padding:12px 16px}
+  .sniper-stat .label{font-size:10px;color:var(--dim);letter-spacing:.06em;margin-bottom:4px}
+  .sniper-stat .val{font-family:'Space Mono',monospace;font-size:16px;font-weight:700}
+
+  /* Alerts */
+  .alerts-list{display:flex;flex-direction:column;gap:4px;max-height:200px;overflow-y:auto}
+  .alert-row{display:flex;gap:12px;align-items:flex-start;padding:7px 10px;
+    border-radius:4px;background:rgba(255,255,255,.02);border-left:3px solid var(--border2)}
+  .alert-row.new{border-left-color:var(--green)}
+  .alert-row.close{border-left-color:var(--red)}
+  .alert-row.sniper{border-left-color:var(--orange)}
+  .alert-row.skip{border-left-color:var(--dim)}
+  .alert-time{color:var(--dim);font-size:11px;white-space:nowrap}
+  .alert-msg{font-size:12px;color:var(--text)}
+
+  /* Collector */
+  .collector-bar{display:flex;gap:16px;align-items:center;padding:10px 18px;
+    background:rgba(255,255,255,.015);border-top:1px solid var(--border);font-size:11px;color:var(--dim)}
+  .collector-bar .count{color:var(--purple);font-family:'Space Mono',monospace}
+
+  /* Uptime */
+  #uptime{font-family:'Space Mono',monospace;font-size:13px;color:var(--dim)}
+
+  /* Last update flash */
+  .flash{animation:flash .3s ease}
+  @keyframes flash{0%{opacity:.4}100%{opacity:1}}
+
+  /* Scrollbar */
+  ::-webkit-scrollbar{width:4px;height:4px}
+  ::-webkit-scrollbar-track{background:var(--bg)}
+  ::-webkit-scrollbar-thumb{background:var(--border2);border-radius:2px}
+
+  .no-data{color:var(--dim);font-size:12px;padding:20px;text-align:center}
+</style>
+</head>
+<body>
+
+<div class="grid">
+
+  <!-- HEADER -->
+  <header class="header">
+    <div class="header-left">
+      <div class="live-dot"></div>
+      <div class="logo">POLY<span>MARKET</span></div>
+      <div class="badge">PAPER MODE</div>
+    </div>
+    <div class="header-right">
+      <div class="stat-mini">
+        <div class="label">UPTIME</div>
+        <div class="val" id="uptime">--:--:--</div>
+      </div>
+      <div class="stat-mini">
+        <div class="label">WALLET</div>
+        <div class="val hl-cyan" id="wallet" style="font-size:11px">--</div>
+      </div>
+      <div class="stat-mini">
+        <div class="label">LAST UPDATE</div>
+        <div class="val" id="last-update">--</div>
+      </div>
+    </div>
+  </header>
+
+  <!-- BUDGET -->
+  <div class="panel wide">
+    <div class="panel-header">
+      <div class="panel-title" style="color:var(--green)">▼ Copy Trader Budget</div>
+    </div>
+    <div class="budget-grid" id="budget-grid">
+      <div class="budget-card"><div class="label">Portfolio</div><div class="amount hl-cyan" id="b-portfolio">$0.00</div><div class="sub">total value</div></div>
+      <div class="budget-card"><div class="label">Available</div><div class="amount pos" id="b-available">$0.00</div><div class="sub">cash ready</div></div>
+      <div class="budget-card"><div class="label">Invested</div><div class="amount hl-yel" id="b-invested">$0.00</div><div class="sub" id="b-pct">0% deployed</div></div>
+      <div class="budget-card"><div class="label">Realized P&L</div><div class="amount" id="b-realized">$0.00</div><div class="sub" id="b-session">session: $0.00</div></div>
+    </div>
+    <div class="progress-wrap">
+      <div class="progress-labels"><span>Invested</span><span id="progress-label">0%</span></div>
+      <div class="progress-bar"><div class="progress-fill" id="progress-fill" style="width:0%"></div></div>
+    </div>
+  </div>
+
+  <!-- OPEN POSITIONS -->
+  <div class="panel wide">
+    <div class="panel-header">
+      <div class="panel-title" style="color:var(--yellow)">▼ Open Positions</div>
+      <div class="panel-count" id="open-count">0 positions</div>
+    </div>
+    <div class="panel-body" style="padding:0">
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Market</th>
+              <th>Side</th>
+              <th class="num">Entry</th>
+              <th class="num">Now</th>
+              <th class="num">In$</th>
+              <th class="num">P&L</th>
+              <th class="num">ROI</th>
+              <th class="num">Time Left</th>
+              <th>URL</th>
+            </tr>
+          </thead>
+          <tbody id="open-tbody">
+            <tr><td colspan="10" class="empty">No open positions</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- CLOSED TRADES -->
+  <div class="panel wide">
+    <div class="panel-header">
+      <div class="panel-title" style="color:var(--green)">▼ Closed Trades</div>
+      <div class="panel-count" id="closed-count">0 total</div>
+    </div>
+    <div class="panel-body" style="padding:0">
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Market</th>
+              <th>Side</th>
+              <th class="num">Entry</th>
+              <th class="num">Exit</th>
+              <th class="num">In$</th>
+              <th class="num">Out$</th>
+              <th class="num">Profit</th>
+              <th class="num">ROI</th>
+              <th>How</th>
+              <th>Closed</th>
+              <th>URL</th>
+            </tr>
+          </thead>
+          <tbody id="closed-tbody">
+            <tr><td colspan="12" class="empty">No closed trades yet</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- SNIPER TESTER -->
+  <div class="panel wide">
+    <div class="panel-header">
+      <div class="panel-title" style="color:var(--orange)">▼ Sniper Tester — Volume Spike Signal</div>
+      <div class="panel-count">separate $100 paper budget</div>
+    </div>
+    <div class="sniper-stats">
+      <div class="sniper-stat"><div class="label">Capital</div><div class="val hl-cyan" id="s-capital">$100.00</div></div>
+      <div class="sniper-stat"><div class="label">Session P&L</div><div class="val" id="s-session">$+0.00</div></div>
+      <div class="sniper-stat"><div class="label">Trades</div><div class="val hl-yel" id="s-trades">0</div></div>
+      <div class="sniper-stat"><div class="label">Win Rate</div><div class="val" id="s-winrate">N/A</div></div>
+      <div class="sniper-stat"><div class="label">Total P&L</div><div class="val" id="s-pnl">$+0.00</div></div>
+    </div>
+    <div class="panel-body" style="padding:0">
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Slug</th>
+              <th>Direction</th>
+              <th class="num">Entry</th>
+              <th class="num">Vol Ratio</th>
+              <th class="num">Move</th>
+              <th>Status</th>
+              <th class="num">Profit</th>
+              <th class="num">ROI</th>
+            </tr>
+          </thead>
+          <tbody id="sniper-tbody">
+            <tr><td colspan="9" class="empty">Watching for volume spikes (≥10x vol + ≥12% move)...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- ALERTS + COLLECTOR -->
+  <div class="panel wide">
+    <div class="panel-header">
+      <div class="panel-title" style="color:var(--purple)">▼ Alerts</div>
+      <div class="panel-count" id="alert-count">0 events</div>
+    </div>
+    <div class="panel-body">
+      <div class="alerts-list" id="alerts-list">
+        <div class="no-data">Monitoring target wallet...</div>
+      </div>
+    </div>
+    <div class="collector-bar">
+      <span>Data collector:</span>
+      <span class="count" id="col-count">0</span>
+      <span>snapshots →</span>
+      <span>logs/live_market_data.csv</span>
+      <span style="margin-left:auto">Refreshes every 3s</span>
+    </div>
+  </div>
+
+</div><!-- /grid -->
+
+<script>
+const DATA_FILE = 'dashboard_data.json';
+let startTs = null;
+let alertsSeen = new Set();
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+function pnlClass(v){ return v > 0 ? 'pos' : v < 0 ? 'neg' : 'neu' }
+function pnlFmt(v){ return (v>=0?'+':'')+v.toFixed(2) }
+function pct(v){ return (v>=0?'+':'')+v.toFixed(1)+'%' }
+
+function timeLeft(endTs){
+  const secs = Math.floor(endTs - Date.now()/1000);
+  if(secs <= 0) return {str:'ENDED', cls:'neg'};
+  const h=Math.floor(secs/3600), m=Math.floor((secs%3600)/60), s=secs%60;
+  if(h>0) return {str:`${h}h ${String(m).padStart(2,'0')}m`, cls:'time-ok'};
+  if(m>0) return {str:`${m}m ${String(s).padStart(2,'0')}s`, cls:'time-warn'};
+  return {str:`${s}s!!`, cls:'time-critical'};
+}
+
+function fmtTime(ts){
+  return new Date(ts*1000).toLocaleTimeString('en-GB',{hour12:false});
+}
+
+function reasonPill(r){
+  const cls = r==='manual'?'pill-manual':r==='expired'?'pill-expired':'pill-closed';
+  return `<span class="pill ${cls}">${r}</span>`;
+}
+
+function sidePill(side){
+  const up = side.toLowerCase()==='up'||side.toLowerCase()==='yes';
+  return `<span class="pill ${up?'pill-up':'pill-dn'}">${side}</span>`;
+}
+
+// ── Uptime ─────────────────────────────────────────────────────────────────
+function updateUptime(){
+  if(!startTs) return;
+  const d = Math.floor(Date.now()/1000 - startTs);
+  const h=Math.floor(d/3600), m=Math.floor((d%3600)/60), s=d%60;
+  document.getElementById('uptime').textContent =
+    `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+}
+setInterval(updateUptime, 1000);
+
+// ── Time left live update ──────────────────────────────────────────────────
+function refreshTimers(){
+  document.querySelectorAll('[data-end-ts]').forEach(el=>{
+    const ts = parseInt(el.dataset.endTs);
+    const {str,cls} = timeLeft(ts);
+    el.textContent = str;
+    el.className = 'num ' + cls;
+  });
+}
+setInterval(refreshTimers, 1000);
+
+// ── Render ─────────────────────────────────────────────────────────────────
+function render(data){
+  startTs = startTs || data.start_time;
+  document.getElementById('wallet').textContent = data.wallet.slice(0,20)+'...';
+  document.getElementById('last-update').textContent = new Date().toLocaleTimeString();
+
+  const s = data.summary;
+  const spnl = s.available - s.session_start;
+
+  // Budget
+  document.getElementById('b-portfolio').textContent  = '$'+s.budget.toFixed(2);
+  document.getElementById('b-available').textContent  = '$'+s.available.toFixed(2);
+  document.getElementById('b-invested').textContent   = '$'+s.invested.toFixed(2);
+  document.getElementById('b-pct').textContent        = s.invested_pct.toFixed(0)+'% deployed';
+  const rlzEl = document.getElementById('b-realized');
+  rlzEl.textContent = '$'+pnlFmt(s.realized);
+  rlzEl.className = 'amount '+ pnlClass(s.realized);
+  const sessEl = document.getElementById('b-session');
+  sessEl.textContent = 'session: $'+pnlFmt(spnl);
+  sessEl.className = 'sub '+pnlClass(spnl);
+  document.getElementById('progress-fill').style.width = Math.min(s.invested_pct,100)+'%';
+  document.getElementById('progress-label').textContent = s.invested_pct.toFixed(0)+'%';
+
+  // Open positions
+  document.getElementById('open-count').textContent = s.n_open+' position'+(s.n_open!==1?'s':'');
+  const openTbody = document.getElementById('open-tbody');
+  if(!data.positions.length){
+    openTbody.innerHTML = '<tr><td colspan="10" class="empty">No open positions</td></tr>';
+  } else {
+    openTbody.innerHTML = data.positions.map((p,i)=>{
+      const {str:tls, cls:tlc} = timeLeft(p.end_ts);
+      const pnl  = p.cur_value - p.entry_amount;
+      const roi  = p.entry_price>0?(p.cur_price-p.entry_price)/p.entry_price*100:0;
+      return `<tr>
+        <td class="mono hl-cyan">[${i}]</td>
+        <td style="max-width:260px;overflow:hidden;text-overflow:ellipsis">${p.market_title}</td>
+        <td>${sidePill(p.outcome)}</td>
+        <td class="num" style="color:var(--dim)">$${p.entry_price.toFixed(4)}</td>
+        <td class="num hl-cyan">$${p.cur_price.toFixed(4)}</td>
+        <td class="num hl-yel">$${p.entry_amount.toFixed(2)}</td>
+        <td class="num ${pnlClass(pnl)}">$${pnlFmt(pnl)}</td>
+        <td class="num ${pnlClass(roi)}">${pct(roi)}</td>
+        <td class="${tlc}" data-end-ts="${p.end_ts}">${tls}</td>
+        <td><a class="url-link" href="${p.url}" target="_blank">↗ open</a></td>
+      </tr>`;
+    }).join('');
+  }
+
+  // Closed trades
+  document.getElementById('closed-count').textContent = s.n_closed+' total';
+  const closedTbody = document.getElementById('closed-tbody');
+  if(!data.closed_trades.length){
+    closedTbody.innerHTML = '<tr><td colspan="12" class="empty">No closed trades yet</td></tr>';
+  } else {
+    closedTbody.innerHTML = data.closed_trades.map((t,i)=>{
+      const pnl = t.realized_pnl;
+      const roi = t.entry_price>0?(t.exit_price-t.entry_price)/t.entry_price*100:0;
+      return `<tr>
+        <td class="mono hl-cyan">[${i}]</td>
+        <td style="max-width:240px;overflow:hidden;text-overflow:ellipsis">${t.market_title}</td>
+        <td>${sidePill(t.outcome)}</td>
+        <td class="num" style="color:var(--dim)">$${t.entry_price.toFixed(4)}</td>
+        <td class="num hl-cyan">$${t.exit_price.toFixed(4)}</td>
+        <td class="num hl-yel">$${t.entry_amount.toFixed(2)}</td>
+        <td class="num hl-cyan">$${t.exit_amount.toFixed(2)}</td>
+        <td class="num ${pnlClass(pnl)}">$${pnlFmt(pnl)}</td>
+        <td class="num ${pnlClass(roi)}">${pct(roi)}</td>
+        <td>${reasonPill(t.reason)}</td>
+        <td style="color:var(--dim);font-size:11px">${fmtTime(t.closed_at)}</td>
+        <td><a class="url-link" href="${t.url}" target="_blank">↗</a></td>
+      </tr>`;
+    }).join('');
+  }
+
+  // Sniper
+  const ss = data.sniper;
+  const sn_sess = ss.capital - 100;
+  document.getElementById('s-capital').textContent = '$'+ss.capital.toFixed(2);
+  const snSessEl = document.getElementById('s-session');
+  snSessEl.textContent = '$'+pnlFmt(sn_sess);
+  snSessEl.className = 'val '+pnlClass(sn_sess);
+  document.getElementById('s-trades').textContent = ss.n_closed;
+  const wrEl = document.getElementById('s-winrate');
+  wrEl.textContent = ss.n_closed>0?(ss.win_rate*100).toFixed(0)+'%':'N/A';
+  wrEl.className = 'val '+(ss.n_closed>0?(ss.win_rate>=0.6?'pos':'neg'):'neu');
+  const pnlEl = document.getElementById('s-pnl');
+  pnlEl.textContent = '$'+pnlFmt(ss.pnl);
+  pnlEl.className = 'val '+pnlClass(ss.pnl);
+
+  const sniperTbody = document.getElementById('sniper-tbody');
+  const allSniper = [...(ss.open_trades||[]).map(t=>({...t,status:'open'})),
+                     ...(ss.closed_trades||[])].slice(-20).reverse();
+  if(!allSniper.length){
+    sniperTbody.innerHTML = '<tr><td colspan="9" class="empty">Watching for volume spikes...</td></tr>';
+  } else {
+    sniperTbody.innerHTML = allSniper.map(t=>{
+      const isOpen = t.status==='open';
+      const {str:tls,cls:tlc} = timeLeft(t.end_ts||0);
+      const statusHtml = isOpen
+        ? `<span class="pill" style="background:rgba(88,166,255,.1);color:var(--cyan);border:1px solid rgba(88,166,255,.2)">LIVE</span>`
+        : t.status==='won'
+          ? `<span class="pill pill-up">WIN</span>`
+          : `<span class="pill pill-dn">LOSS</span>`;
+      return `<tr>
+        <td style="color:var(--dim);font-size:11px">${new Date(t.entered_at*1000).toLocaleTimeString('en-GB',{hour12:false})}</td>
+        <td class="mono" style="font-size:11px">${(t.slug||'').slice(-12)}</td>
+        <td>${sidePill(t.direction)}</td>
+        <td class="num">$${t.entry_price.toFixed(4)}</td>
+        <td class="num hl-orn">${t.vol_ratio.toFixed(0)}x</td>
+        <td class="num ${t.move>0?'pos':'neg'}">${t.move>=0?'+':''}${t.move.toFixed(3)}</td>
+        <td>${statusHtml}</td>
+        <td class="num ${isOpen?'neu':pnlClass(t.profit||0)}">${isOpen?'--':'$'+pnlFmt(t.profit||0)}</td>
+        <td class="num ${isOpen?'neu':pnlClass(t.roi_pct||0)}">${isOpen?'--':pct(t.roi_pct||0)}</td>
+      </tr>`;
+    }).join('');
+  }
+
+  // Alerts
+  document.getElementById('alert-count').textContent = (data.alerts||[]).length+' events';
+  document.getElementById('col-count').textContent = data.collector_rows||0;
+  const alertsList = document.getElementById('alerts-list');
+  const alerts = (data.alerts||[]).slice(-20).reverse();
+  if(!alerts.length){
+    alertsList.innerHTML = '<div class="no-data">Monitoring target wallet...</div>';
+  } else {
+    alertsList.innerHTML = alerts.map(a=>{
+      const cls = a.includes('NEW BET')?'new':a.includes('SNIPER')?'sniper':
+                  (a.includes('CLOSED')||a.includes('EXPIRED')||a.includes('MANUAL'))?'close':'skip';
+      const ts = a.match(/\[(\d{2}:\d{2}:\d{2})\]/);
+      const msg = a.replace(/\[\d{2}:\d{2}:\d{2}\]\s*/,'');
+      return `<div class="alert-row ${cls}">
+        <span class="alert-time">${ts?ts[1]:''}</span>
+        <span class="alert-msg">${msg}</span>
+      </div>`;
+    }).join('');
+  }
+}
+
+// ── Fetch loop ─────────────────────────────────────────────────────────────
+async function fetchData(){
+  try {
+    const r = await fetch(DATA_FILE+'?t='+Date.now());
+    if(!r.ok) throw new Error('no data');
+    const data = await r.json();
+    document.getElementById('last-update').className = 'val flash';
+    render(data);
+    setTimeout(()=>document.getElementById('last-update').className='val',300);
+  } catch(e){
+    document.getElementById('last-update').textContent = 'waiting...';
+  }
+}
+fetchData();
+setInterval(fetchData, 3000);
+</script>
+</body>
+</html>
